@@ -172,7 +172,10 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
 
 <!-- 扫描 -->
 <div id="p-scan" class="page">
-  <button class="btn btn-primary" id="btn-scan" onclick="startScan()">开始全市场扫描</button>
+  <div style="padding-top:30vh;text-align:center" id="scan-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">扫描全市场，筛选高评分候选股</div>
+    <button class="btn btn-primary" id="btn-scan" onclick="startScan()" style="max-width:280px;margin:0 auto;font-size:17px;padding:16px;border-radius:14px">开始全市场扫描</button>
+  </div>
   <div id="scan-progress" style="display:none">
     <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="scan-msg">准备中...</div>
     <div class="progress-wrap"><div class="progress-bar" id="scan-bar"></div></div>
@@ -182,9 +185,12 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
 
 <!-- 决策 -->
 <div id="p-go" class="page">
-  <button class="btn btn-primary" id="btn-go" onclick="startGo()" style="font-size:18px;padding:18px">
-    一键决策
-  </button>
+  <div style="padding-top:28vh;text-align:center" id="go-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">综合15维度分析，推荐3只股票+买卖计划</div>
+    <button class="btn btn-primary" id="btn-go" onclick="startGo()" style="max-width:280px;margin:0 auto;font-size:20px;padding:20px 40px;border-radius:16px">
+      一键决策
+    </button>
+  </div>
   <div id="go-progress" style="display:none">
     <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="go-msg">准备中...</div>
     <div class="progress-wrap"><div class="progress-bar" id="go-bar"></div></div>
@@ -314,6 +320,7 @@ async function loadMarket() {
 // ── 扫描 ──
 function startScan() {
   $('#btn-scan').disabled = true;
+  $('#scan-btn-wrap').style.paddingTop = '16px';
   $('#scan-progress').style.display = 'block';
   $('#scan-results').innerHTML = '';
   const es = new EventSource('/api/scan?top=15');
@@ -367,6 +374,7 @@ function renderScanResults(d) {
 // ── 一键决策 ──
 function startGo() {
   $('#btn-go').disabled = true;
+  $('#go-btn-wrap').style.paddingTop = '16px';
   $('#go-progress').style.display = 'block';
   $('#go-results').innerHTML = '';
   const es = new EventSource('/api/go');

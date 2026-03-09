@@ -492,15 +492,21 @@ def api_go():
 
             results.sort(key=lambda x: x["评分"], reverse=True)
 
-            # 选2只，优先不同行业
+            # 选3只，优先不同行业分散风险
             selected = [results[0]]
-            first_ind = results[0].get("行业", "")
+            used_ind = {results[0].get("行业", "")}
             for r in results[1:]:
-                if r.get("行业", "") and r.get("行业", "") != first_ind:
-                    selected.append(r)
+                if len(selected) >= 3:
                     break
-            if len(selected) < 2 and len(results) >= 2:
-                selected.append(results[1])
+                r_ind = r.get("行业", "")
+                if r_ind and r_ind not in used_ind:
+                    selected.append(r)
+                    used_ind.add(r_ind)
+            for r in results[1:]:
+                if len(selected) >= 3:
+                    break
+                if r not in selected:
+                    selected.append(r)
 
             # 信心指数
             confidence = 50

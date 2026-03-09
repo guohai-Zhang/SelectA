@@ -18,7 +18,7 @@ A股 T+1 短线分析工具 v3.0
     python3 t1_trader.py --calibrate    # 信号校准：用历史数据计算每个信号真实胜率→自动优化权重
     python3 t1_trader.py --market       # 查看大盘情绪
     python3 t1_trader.py --sector       # 查看板块资金流向
-    python3 t1_trader.py --go           # 一键决策：直接推荐2只股票+明日卖出策略
+    python3 t1_trader.py --go           # 一键决策：直接推荐3只股票+明日卖出策略
 """
 
 import requests
@@ -2771,7 +2771,7 @@ def analyze_news_sentiment(news_list):
 # ============================================================
 
 def go_decision():
-    """一键决策：综合所有维度，推荐2只股票 + 明日卖出策略"""
+    """一键决策：综合所有维度，推荐3只股票 + 明日卖出策略"""
 
     print()
     print("=" * 65)
@@ -3033,16 +3033,21 @@ def go_decision():
     # ── 排序选股 ──
     results.sort(key=lambda x: x["评分"], reverse=True)
 
-    # 选2只：优先不同行业分散风险
+    # 选3只：优先不同行业分散风险
     selected = [results[0]]
-    first_industry = results[0].get("行业", "")
+    used_ind = {results[0].get("行业", "")}
     for r in results[1:]:
-        r_ind = r.get("行业", "")
-        if r_ind and r_ind != first_industry:
-            selected.append(r)
+        if len(selected) >= 3:
             break
-    if len(selected) < 2 and len(results) >= 2:
-        selected.append(results[1])
+        r_ind = r.get("行业", "")
+        if r_ind and r_ind not in used_ind:
+            selected.append(r)
+            used_ind.add(r_ind)
+    for r in results[1:]:
+        if len(selected) >= 3:
+            break
+        if r not in selected:
+            selected.append(r)
 
     # ── 输出决策 ──
     print()

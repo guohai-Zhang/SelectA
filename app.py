@@ -16,6 +16,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import t1_trader as t1
 
+# ── 简单缓存 ──
+_cache = {}
+_cache_ttl = {}
+
+def cached_call(key, func, ttl=120, *args, **kwargs):
+    """缓存函数调用结果，ttl秒后过期"""
+    now = time.time()
+    if key in _cache and now - _cache_ttl.get(key, 0) < ttl:
+        return _cache[key]
+    result = func(*args, **kwargs)
+    _cache[key] = result
+    _cache_ttl[key] = now
+    return result
+
+
 app = FastAPI(title="A股 T+1 短线分析")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -75,6 +90,11 @@ def api_market():
         nb_total, nb_info = t1.fetch_northbound_flow()
         can_trade, reason, severity = t1.market_go_nogo(
             money, limit_up=limit_up, limit_down=limit_down)
+
+        # 全球市场 + 大宗商品（缓存5分钟）
+        global_markets = cached_call("global_markets", t1.fetch_global_markets, 300)
+        commodity_data = cached_call("commodity", t1.fetch_commodity_prices, 300)
+
         return jsonable({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "indices": sentiments,
@@ -83,6 +103,8 @@ def api_market():
             "limits": {"up": limit_up, "down": limit_down},
             "northbound": {"total": nb_total, "info": nb_info},
             "market_status": {"can_trade": can_trade, "reason": reason, "severity": severity},
+            "global_markets": global_markets,
+            "commodity": commodity_data,
         })
     except Exception as e:
         return {"error": str(e)}
@@ -256,10 +278,10 @@ def api_scan(top: int = Query(15, ge=1, le=50)):
 
             yield sse({"type": "progress", "msg": "获取市场情绪+全球数据...", "pct": 10})
             sentiment_score, sentiment_info = t1.get_sentiment_score()
-            commodity_data = t1.fetch_commodity_prices()
-            global_markets = t1.fetch_global_markets()
+            commodity_data = cached_call("commodity", t1.fetch_commodity_prices, 300)
+            global_markets = cached_call("global_markets", t1.fetch_global_markets, 300)
             global_penalty, _, _ = t1.calc_global_risk(global_markets)
-            ah_data = t1.fetch_ah_premium()
+            ah_data = cached_call("ah_premium", t1.fetch_ah_premium, 300)
 
             yield sse({"type": "progress", "msg": "获取板块/资金/龙虎榜...", "pct": 15})
             hot_sectors = t1.get_hot_sectors()
@@ -598,42 +620,66 @@ def api_go():
 
             results.sort(key=lambda x: x["评分"], reverse=True)
 
-            # 选3只，优先不同行业分散风险
-            selected = [results[0]]
-            used_ind = {results[0].get("行业", "")}
-            for r in results[1:]:
+            # ★ 过滤：只保留"推荐"及以上等级（仅参考的不进入决策）
+            qualified = [r for r in results if r["推荐等级"] in ("强推荐", "推荐", "弱推荐")]
+            if not qualified:
+                qualified = results[:3]  # 实在没有就取前3但降低信心
+
+            # 选3只，优先不同行业分散风险，优先高推荐等级
+            level_order = {"强推荐": 0, "推荐": 1, "弱推荐": 2, "仅参考": 3}
+            qualified.sort(key=lambda x: (level_order.get(x["推荐等级"], 3), -x["评分"]))
+            selected = [qualified[0]]
+            used_ind = {qualified[0].get("行业", "")}
+            for r in qualified[1:]:
                 if len(selected) >= 3:
                     break
                 r_ind = r.get("行业", "")
                 if r_ind and r_ind not in used_ind:
                     selected.append(r)
                     used_ind.add(r_ind)
-            for r in results[1:]:
+            for r in qualified[1:]:
                 if len(selected) >= 3:
                     break
                 if r not in selected:
                     selected.append(r)
 
-            # 信心指数
-            confidence = 50
-            confidence += min(sentiment_score, 15)
-            confidence += min(int(news_score * 2), 15)
-            if selected[0]["评分"] >= 140:
-                confidence += 15
-            elif selected[0]["评分"] >= 110:
-                confidence += 10
-            if selected[0].get("聪明钱分", 0) >= 30:
+            # ★ 信心指数 — 更保守的计算
+            confidence = 40  # ★ 基础值从50降到40
+            confidence += min(sentiment_score, 10)  # ★ 情绪最多+10（从15降）
+            confidence += min(int(news_score * 1.5), 10)  # ★ 新闻最多+10（从15降）
+            # ★ 基于推荐等级而非纯评分
+            top_level = selected[0].get("推荐等级", "仅参考")
+            if top_level == "强推荐":
+                confidence += 20
+            elif top_level == "推荐":
+                confidence += 12
+            elif top_level == "弱推荐":
                 confidence += 5
+            # ★ 多只候选信心加成
+            strong_count = sum(1 for s in selected if s["推荐等级"] in ("强推荐", "推荐"))
+            confidence += strong_count * 3
             # 市场熔断时降低信心
             if market_blocked:
-                confidence -= 25
-            confidence = max(20, min(confidence, 95))
+                confidence -= 30
+            # ★ 全球风险
+            if global_penalty < -5:
+                confidence -= 10
+            confidence = max(15, min(confidence, 85))  # ★ 上限从95降到85（永远不要太自信）
 
             # 连板统计
             boards_count = {}
             for v in limit_up_pool.values():
                 b = v.get("连板数", 1)
                 boards_count[b] = boards_count.get(b, 0) + 1
+
+            # 记录推荐
+            try:
+                from trade_tracker import record_recommendation
+                for s in selected:
+                    record_recommendation("T+1", s["代码"], s["名称"], s["最新价"],
+                                           s["评分"], s["推荐等级"], s.get("信号"), s.get("risk"))
+            except Exception:
+                pass
 
             yield sse({"type": "result", "data": {
                 "selected": selected,
@@ -665,6 +711,199 @@ def api_go():
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── API: T+5 波段决策 (SSE) ──
+
+@app.get("/api/go5")
+def api_go5():
+    def generate():
+        try:
+            yield sse({"type": "progress", "msg": "检测市场环境...", "pct": 3})
+            cal_weights, cal_threshold, cal_combos = t1.load_calibrated_weights()
+            money_effect = t1.calc_money_effect()
+            sentiment_score, sentiment_info = t1.get_sentiment_score()
+            market_regime, regime_adj, regime_label = t1.calc_market_regime()
+            calendar_adj, calendar_label = t1.calc_calendar_adjustment()
+
+            yield sse({"type": "progress", "msg": "扫描新闻+板块...", "pct": 8})
+            news = t1.fetch_news()
+            global_news = t1.fetch_global_news()
+            all_news = news + global_news
+            news_score, hot_concepts, key_headlines, veto_industries = t1.analyze_news_sentiment(all_news)
+            _, trend_industries, _ = t1.analyze_global_news(global_news)
+            hot_sectors = t1.get_hot_sectors()
+            billboard_data = t1.fetch_billboard()
+            nb_total, nb_info = t1.fetch_northbound_flow()
+            margin_data = t1.fetch_margin_data_top()
+            limit_up, limit_down = t1.count_limit_up()
+            limit_up_pool = t1.fetch_limit_up_pool()
+            shareholder_data = t1.fetch_shareholder_increase()
+            industry_data = t1.fetch_industry_prosperity()
+
+            yield sse({"type": "progress", "msg": "获取股票列表+资金...", "pct": 20})
+            capital_rank = t1.fetch_capital_flow_rank(top_n=300)
+            fund_batch = t1.fetch_fundamentals_batch()
+            stock_list = t1.fetch_stock_list_sina()
+            if stock_list.empty:
+                yield sse({"type": "error", "msg": "无法获取股票列表"})
+                return
+
+            # T+5 宽筛选
+            stock_list = stock_list[
+                (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 100) &
+                (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 5) &
+                (stock_list["换手率"] >= 1.5) & (stock_list["量比"] >= 0.6)
+            ]
+            capital_codes = set(capital_rank.keys())
+            bb_codes = set(billboard_data.keys())
+            p1 = stock_list[stock_list["代码"].isin(capital_codes & bb_codes)]["代码"].tolist()
+            p2 = stock_list[stock_list["代码"].isin(capital_codes - bb_codes)]["代码"].tolist()
+            p3 = stock_list[~stock_list["代码"].isin(capital_codes | bb_codes)]["代码"].tolist()[:300]
+            analyze_list = p1 + p2 + p3
+            code_to_row = stock_list.set_index("代码").to_dict("index")
+
+            yield sse({"type": "progress", "msg": f"T+5门控分析 {len(analyze_list)} 只...", "pct": 30})
+
+            results = []
+            done = [0]
+            total = len(analyze_list)
+
+            def analyze_one(code):
+                kl = t1.fetch_kline(code, days=120)
+                if kl.empty or len(kl) < 60:
+                    return None
+                kl = t1.calc_all_indicators(kl)
+                cap_info = capital_rank.get(code)
+                sec_score = 10 if code in capital_codes else 3
+                fi = fund_batch.get(code, {})
+                fs, fd, fr = t1.evaluate_fundamentals(fi)
+                stock_ind = ""
+                if code in billboard_data or code in limit_up_pool or code in shareholder_data:
+                    stock_ind = t1.get_stock_industry(code)
+                row = code_to_row.get(code, {})
+                name = str(row.get("名称", ""))
+                if veto_industries:
+                    if stock_ind and any(vi in stock_ind for vi in veto_industries):
+                        return None
+                    if any(vi in name for vi in veto_industries):
+                        return None
+                wt_adj, _ = t1.calc_weekly_trend(kl)
+                tc_adj, _ = t1.classify_trend_context(kl)
+                es, ed, er = t1.evaluate_extra_dimensions(
+                    code, billboard_data, margin_data, nb_total, limit_up, limit_down,
+                    limit_up_pool, {}, shareholder_data, industry_data, stock_ind)
+                tech_sc, pos_mult, d, r, passed = t1.evaluate_signals_gated(
+                    kl, cap_info, sec_score, sentiment_score, fs, fd, es, ed,
+                    calibrated_weights=cal_weights, golden_combos=cal_combos,
+                    market_regime_adj=regime_adj, weekly_trend_adj=wt_adj,
+                    trend_context_adj=tc_adj, calendar_adj=calendar_adj)
+                if not passed:
+                    return None
+                has_combo = d.get("黄金组合匹配", False)
+                if has_combo and tech_sc >= t1.TECH_GATE_THRESHOLD + 15:
+                    rec_level = "强推荐"
+                elif has_combo or tech_sc >= t1.TECH_GATE_THRESHOLD + 10:
+                    rec_level = "推荐"
+                else:
+                    rec_level = "弱推荐"
+                latest = kl.iloc[-1]
+                price = float(row.get("最新价", latest["收盘"]))
+                mktcap_yi = row.get("总市值", 0)
+                if isinstance(mktcap_yi, (int, float)) and mktcap_yi > 0:
+                    mktcap_yi = mktcap_yi / 1e8
+                else:
+                    mktcap_yi = fi.get("总市值", 0) or 0
+                _, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
+                risk = t1.calc_position_and_risk_t5(
+                    tech_sc, pos_mult, sentiment_score, nb_total,
+                    limit_up, limit_down, price, kl, largecap_adj=lc_adj)
+                return {
+                    "代码": code, "名称": name, "最新价": price,
+                    "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
+                    "技术分": tech_sc, "仓位倍率": pos_mult,
+                    "基本面分": fs, "聪明钱分": es,
+                    "推荐等级": rec_level, "信号": d, "理由": r,
+                    "行业": stock_ind, "risk": risk, "黄金组合": has_combo,
+                }
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(analyze_one, c): c for c in analyze_list}
+                for f in as_completed(futures):
+                    done[0] += 1
+                    try:
+                        r = f.result()
+                        if r:
+                            results.append(r)
+                    except Exception:
+                        pass
+                    if done[0] % 100 == 0:
+                        pct = 30 + int(done[0] / total * 60)
+                        yield sse({"type": "progress",
+                                   "msg": f"进度 {done[0]}/{total}，候选 {len(results)} 只",
+                                   "pct": min(pct, 92)})
+
+            if not results:
+                yield sse({"type": "result", "data": {
+                    "selected": [], "msg": "今日无股票通过技术面独立门槛。"
+                }})
+                return
+
+            results.sort(key=lambda x: x["技术分"], reverse=True)
+            combo_results = [r for r in results if r["黄金组合"]]
+            other_results = [r for r in results if not r["黄金组合"]]
+            selected = []
+            used_ind = set()
+            for pool in [combo_results, other_results]:
+                for r in pool:
+                    if len(selected) >= 3: break
+                    r_ind = r.get("行业", "")
+                    if r_ind and r_ind in used_ind: continue
+                    selected.append(r)
+                    if r_ind: used_ind.add(r_ind)
+            for r in results:
+                if len(selected) >= 3: break
+                if r not in selected: selected.append(r)
+
+            yield sse({"type": "result", "data": {
+                "selected": selected,
+                "total_passed": len(results),
+                "combo_count": len(combo_results),
+                "market_info": {
+                    "sentiment": {"score": sentiment_score, "info": sentiment_info},
+                    "regime": {"label": regime_label, "adj": regime_adj},
+                    "news_mood": "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空",
+                    "hot_concepts": [{"name": c, "score": s} for c, s in hot_concepts[:5]],
+                },
+            }})
+
+            # 记录推荐
+            try:
+                from trade_tracker import record_recommendation
+                for s in selected:
+                    record_recommendation("T+5", s["代码"], s["名称"], s["最新价"],
+                                           s["技术分"], s["推荐等级"], s["risk"])
+            except Exception:
+                pass
+
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── API: 交易记录 ──
+
+@app.get("/api/trades")
+def api_trades():
+    try:
+        from trade_tracker import get_trade_history, get_performance_summary
+        history = get_trade_history(days=30)
+        summary = get_performance_summary()
+        return {"trades": history, "summary": summary}
+    except Exception as e:
+        return {"error": str(e), "trades": [], "summary": {}}
 
 
 # ── API: ETF 波段扫描 (SSE) ──

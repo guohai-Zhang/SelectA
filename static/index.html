@@ -28,8 +28,8 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   padding-bottom:var(--safe-b);background:#0a0a1a;border-top:1px solid var(--border);
   display:flex;z-index:100}
 .tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
-  color:var(--text3);font-size:10px;cursor:pointer;transition:.2s;-webkit-tap-highlight-color:transparent}
-.tab .icon{font-size:20px;margin-bottom:2px}
+  color:var(--text3);font-size:9px;cursor:pointer;transition:.2s;-webkit-tap-highlight-color:transparent;padding:0 1px}
+.tab .icon{font-size:18px;margin-bottom:1px}
 .tab.active{color:var(--red)}
 /* 卡片 */
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;
@@ -165,6 +165,14 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
     <div class="card-title">资金/情绪</div>
     <div id="market-extra"></div>
   </div>
+  <div class="card" id="global-card" style="display:none">
+    <div class="card-title">全球市场</div>
+    <div id="global-markets"></div>
+  </div>
+  <div class="card" id="commodity-card" style="display:none">
+    <div class="card-title">大宗商品</div>
+    <div id="commodity-data"></div>
+  </div>
   <div style="text-align:center;margin-top:12px">
     <span style="font-size:12px;color:var(--text3);cursor:pointer" onclick="loadMarket()">点击刷新</span>
   </div>
@@ -196,6 +204,21 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
     <div class="progress-wrap"><div class="progress-bar" id="go-bar"></div></div>
   </div>
   <div id="go-results"></div>
+</div>
+
+<!-- T+5 波段 -->
+<div id="p-go5" class="page">
+  <div style="padding-top:28vh;text-align:center" id="go5-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">技术面独立门槛+基本面调仓，推荐3只波段股（持有2-5天）</div>
+    <button class="btn btn-primary" id="btn-go5" onclick="startGo5()" style="max-width:280px;margin:0 auto;font-size:20px;padding:20px 40px;border-radius:16px;background:var(--blue)">
+      T+5 波段
+    </button>
+  </div>
+  <div id="go5-progress" style="display:none">
+    <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="go5-msg">准备中...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="go5-bar"></div></div>
+  </div>
+  <div id="go5-results"></div>
 </div>
 
 <!-- ETF -->
@@ -230,14 +253,25 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div id="stock-result"></div>
 </div>
 
+<!-- 战绩 -->
+<div id="p-trades" class="page">
+  <div style="text-align:center;margin-bottom:12px">
+    <button class="btn btn-primary" onclick="loadTrades()" style="max-width:200px;margin:0 auto;padding:10px 24px;font-size:14px;border-radius:10px">刷新战绩</button>
+  </div>
+  <div id="trades-summary"></div>
+  <div id="trades-list"></div>
+</div>
+
 <!-- 标签栏 -->
 <div class="tabs">
   <div class="tab active" onclick="switchTab('market',this)"><span class="icon">&#127968;</span>首页</div>
   <div class="tab" onclick="switchTab('scan',this)"><span class="icon">&#128202;</span>扫描</div>
   <div class="tab" onclick="switchTab('go',this)"><span class="icon">&#127919;</span>决策</div>
+  <div class="tab" onclick="switchTab('go5',this)"><span class="icon">&#128293;</span>波段</div>
   <div class="tab" onclick="switchTab('etf',this)"><span class="icon">&#128176;</span>ETF</div>
   <div class="tab" onclick="switchTab('sector',this)"><span class="icon">&#128200;</span>板块</div>
   <div class="tab" onclick="switchTab('stock',this)"><span class="icon">&#128269;</span>个股</div>
+  <div class="tab" onclick="switchTab('trades',this)"><span class="icon">&#127942;</span>战绩</div>
 </div>
 
 <!-- Toast -->
@@ -269,11 +303,12 @@ function switchTab(name, el) {
   $$('.tab').forEach(t => t.classList.remove('active'));
   $(`#p-${name}`).classList.add('active');
   if (el) el.classList.add('active');
-  else $$('.tab')[['market','scan','go','etf','sector','stock'].indexOf(name)].classList.add('active');
+  else { const idx = ['market','scan','go','go5','etf','sector','stock','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
   currentTab = name;
   localStorage.setItem('tab', name);
   if (name === 'market' && !marketLoaded) loadMarket();
   if (name === 'sector' && !sectorLoaded) loadSector();
+  if (name === 'trades' && !tradesLoaded) loadTrades();
 }
 
 // ── 首页: 大盘情绪 ──
@@ -328,6 +363,36 @@ async function loadMarket() {
       <div>连涨: ${me['连续上涨天数'] || 0}天 连跌: ${me['连续下跌天数'] || 0}天</div>
     </div>`;
     $('#market-extra').innerHTML = extra;
+
+    // 全球市场
+    const gm = d.global_markets || {};
+    if (Object.keys(gm).length) {
+      let gmHtml = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px">';
+      Object.entries(gm).forEach(([name, info]) => {
+        if (info && info['涨跌幅'] != null) {
+          const gc = chgClass(info['涨跌幅']);
+          gmHtml += `<div>${name}: <b class="${gc}">${chgStr(info['涨跌幅'])}</b></div>`;
+        }
+      });
+      gmHtml += '</div>';
+      $('#global-markets').innerHTML = gmHtml;
+      $('#global-card').style.display = '';
+    }
+
+    // 大宗商品
+    const cm = d.commodity || {};
+    if (Object.keys(cm).length) {
+      let cmHtml = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px">';
+      Object.entries(cm).forEach(([name, info]) => {
+        if (info && info['涨跌幅'] != null) {
+          const cc = chgClass(info['涨跌幅']);
+          cmHtml += `<div>${name}: <b class="${cc}">${chgStr(info['涨跌幅'])}</b></div>`;
+        }
+      });
+      cmHtml += '</div>';
+      $('#commodity-data').innerHTML = cmHtml;
+      $('#commodity-card').style.display = '';
+    }
   } catch (e) { toast('加载失败: ' + e.message); }
 }
 
@@ -481,9 +546,9 @@ function renderGoResults(data) {
   });
 
   // 信心指数
-  const conf = data.confidence || 50;
-  const confColor = conf >= 75 ? 'var(--red)' : conf >= 55 ? 'var(--gold)' : 'var(--green)';
-  const confText = conf >= 75 ? '条件较好，可以操作' : conf >= 55 ? '条件一般，轻仓参与' : '条件较差，建议观望';
+  const conf = data.confidence || 40;
+  const confColor = conf >= 70 ? 'var(--red)' : conf >= 50 ? 'var(--gold)' : 'var(--green)';
+  const confText = conf >= 70 ? '信号较强，可轻仓操作' : conf >= 50 ? '信号一般，极轻仓试探' : '信号偏弱，建议观望';
   html += `<div class="confidence">
     <div class="confidence-num" style="color:${confColor}">${conf}%</div>
     <div class="confidence-label">信心指数 — ${confText}</div>
@@ -499,20 +564,119 @@ function renderGoResults(data) {
       ${(mi.hot_sectors||[]).length ? '<div>资金流入: ' + mi.hot_sectors.join(', ') + '</div>' : ''}
       <div>北向: ${mi.northbound?.info || '--'}</div>
       <div>涨停 ${mi.limits?.up||0} / 跌停 ${mi.limits?.down||0}</div>
+      ${mi.global_risk ? '<div>全球风险: <span class="'+(mi.global_risk>5?'down':mi.global_risk>0?'':'up')+'">'+(mi.global_risk>5?'偏高':mi.global_risk>0?'中性':'正常')+'</span></div>' : ''}
     </div>
   </div>`;
 
   // 风险提示
   html += `<div class="card" style="border-color:var(--red)">
     <div style="font-size:12px;color:var(--text2);line-height:1.7">
-      <div style="color:var(--red);font-weight:600;margin-bottom:4px">风险提示</div>
+      <div style="color:var(--red);font-weight:600;margin-bottom:4px">!! 严格纪律 !!</div>
       - 以上仅为技术+资金+新闻综合分析，不构成投资建议<br>
-      - 严格执行止损纪律，-2%必须走<br>
-      - T+1 不留隔夜，15:00前必须清仓
+      - 单只股票仓位不超过总资金30%<br>
+      - 严格执行止损：触及止损价立即卖出，不犹豫<br>
+      - T+1 不留隔夜，14:50前必须清仓<br>
+      - 连续亏损2次当天停止操作<br>
+      - 信心指数<50%时不操作
     </div>
   </div>`;
 
   $('#go-results').innerHTML = html;
+}
+
+// ── T+5 波段 ──
+function startGo5() {
+  $('#btn-go5').disabled = true;
+  $('#go5-btn-wrap').style.paddingTop = '16px';
+  $('#go5-progress').style.display = 'block';
+  $('#go5-results').innerHTML = '';
+  const es = new EventSource('/api/go5');
+  es.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'progress') {
+      $('#go5-msg').textContent = d.msg;
+      $('#go5-bar').style.width = (d.pct || 0) + '%';
+    } else if (d.type === 'error') {
+      toast(d.msg); es.close(); $('#btn-go5').disabled = false;
+    } else if (d.type === 'result') {
+      es.close(); $('#btn-go5').disabled = false;
+      $('#go5-progress').style.display = 'none';
+      renderGo5Results(d.data);
+    }
+  };
+  es.onerror = () => { es.close(); $('#btn-go5').disabled = false; toast('连接断开'); };
+}
+
+function renderGo5Results(data) {
+  const sel = data.selected || [];
+  if (!sel.length) {
+    $('#go5-results').innerHTML = '<div class="card" style="text-align:center;padding:30px;color:var(--text2)">' +
+      (data.msg || '今日无股票通过技术面独立门槛') + '</div>';
+    return;
+  }
+  let html = '';
+
+  sel.forEach((s, i) => {
+    const rk = s.risk || {};
+    const c = chgClass(s['涨跌幅']);
+    const rl = s['推荐等级'] || '弱推荐';
+    const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : 'var(--text2)';
+    const borderColor = rl === '强推荐' ? 'var(--blue)' : rl === '推荐' ? 'var(--gold)' : 'var(--border)';
+    const d = s['信号'] || {};
+    html += `<div class="go-stock" style="border-color:${borderColor}">
+      <div class="go-stock-header">
+        <div>
+          <div class="go-stock-name">第${i+1}只: ${s['名称']}(${s['代码']})</div>
+          <div style="font-size:12px"><span style="color:${rlColor};font-weight:600">${rl}</span> <span style="color:var(--text2)">${s['行业'] || ''}</span></div>
+        </div>
+        <div class="go-stock-score" style="color:var(--blue)">${(s['技术分']||0).toFixed(0)}<span style="font-size:12px;color:var(--text2)">分</span></div>
+      </div>
+      <div style="font-size:13px" class="${c}">现价 ${(s['最新价']||0).toFixed(2)} (${chgStr(s['涨跌幅']||0)})</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px">
+        ${d['技术门槛']||''} | ${d['仓位倍率']||''}
+        ${s['黄金组合']?' | <span style="color:var(--gold)">★黄金组合</span>':''}
+      </div>
+      <div style="font-size:12px;margin-top:4px;color:var(--blue)">买入理由: ${s['理由']||''}</div>
+
+      <div class="go-section">
+        <div class="go-section-title" style="border-color:var(--blue)">T+5 波段风控 (${rk['风险等级']||''} | ATR ${(rk.ATR||0).toFixed(1)}%)</div>
+        <div class="risk-row"><span class="risk-label">建议仓位</span><span class="risk-val">${rk['仓位']||0}%</span></div>
+        <div class="risk-row"><span class="risk-label">止损价</span><span class="risk-val down">${(rk['止损价']||0).toFixed(2)} (${(rk['止损幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标一 (卖1/3)</span><span class="risk-val up">${(rk['止盈一']||0).toFixed(2)} (+${(rk['止盈一幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标二 (再1/3)</span><span class="risk-val up">${(rk['止盈二']||0).toFixed(2)} (+${(rk['止盈二幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标三 (清仓)</span><span class="risk-val up">${(rk['止盈三']||0).toFixed(2)} (+${(rk['止盈三幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">移动止损</span><span class="risk-val" style="font-size:11px">${rk['移动止损']||''}</span></div>
+      </div>
+
+      <div class="go-section">
+        <div class="go-section-title" style="border-color:var(--blue)">持仓5天操作计划</div>
+        <div class="timeline">
+          <div class="timeline-item">Day 1: 尾盘买入，设好止损 ${(rk['止损价']||0).toFixed(2)}</div>
+          <div class="timeline-item">Day 2: 观察趋势确认，不急操作</div>
+          <div class="timeline-item">Day 3: 达目标一 ${(rk['止盈一']||0).toFixed(2)} 卖1/3，止损→成本价</div>
+          <div class="timeline-item">Day 4: 达目标二 ${(rk['止盈二']||0).toFixed(2)} 再卖1/3</div>
+          <div class="timeline-item" style="color:var(--blue);font-weight:600">Day 5: 收盘前无条件清仓！</div>
+        </div>
+      </div>
+    </div>`;
+  });
+
+  // 市场信息
+  const mi = data.market_info || {};
+  html += `<div class="card">
+    <div class="card-title">T+5 综合研判</div>
+    <div style="font-size:13px;line-height:1.8">
+      大盘趋势: ${(mi.regime||{}).label||'中性'}<br>
+      新闻面: ${mi.news_mood||''}<br>
+      通过门槛: ${data.total_passed||0} 只 (黄金组合 ${data.combo_count||0} 只)
+    </div>
+  </div>`;
+
+  html += `<div class="card" style="font-size:11px;color:var(--text2);line-height:1.6">
+    T+5波段风险提示：持有2-5天承受更大波动 | 技术面独立达标才推荐 | 严格执行止损和第5天清仓
+  </div>`;
+
+  $('#go5-results').innerHTML = html;
 }
 
 // ── ETF 波段 ──
@@ -693,6 +857,13 @@ function renderStock(d) {
     <div class="detail-max">/280 综合评分</div>
   </div>`;
 
+  // 风险警告
+  if (d.risk_warnings && d.risk_warnings.length) {
+    html += `<div class="card" style="border-color:var(--red)"><div class="card-title" style="color:var(--red)">风险警告</div>`;
+    d.risk_warnings.forEach(w => { html += `<div style="font-size:13px;color:var(--red);margin:2px 0">⚠ ${w}</div>`; });
+    html += '</div>';
+  }
+
   // 买入理由
   html += `<div class="card"><div class="card-title">买入理由</div>
     <div style="color:var(--gold);font-size:13px">${d.reasons || '信号不足'}</div></div>`;
@@ -757,6 +928,74 @@ function renderStock(d) {
   }
 
   $('#stock-result').innerHTML = html;
+}
+
+// ── 战绩 ──
+let tradesLoaded = false;
+async function loadTrades() {
+  tradesLoaded = true;
+  $('#trades-summary').innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+  $('#trades-list').innerHTML = '';
+  try {
+    const r = await fetch('/api/trades');
+    const d = await r.json();
+    if (d.error) { toast(d.error); return; }
+    renderTrades(d);
+  } catch(e) { toast('加载失败: '+e.message); }
+}
+
+function renderTrades(d) {
+  const s = d.summary || {};
+  const trades = d.trades || [];
+  let html = '';
+
+  // 总体统计
+  const d1 = s.overall_d1 || {};
+  const d5 = s.overall_d5 || {};
+  html += `<div class="card"><div class="card-title">总体表现 (共${s.total_trades||0}条推荐)</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
+      <div>D+1 胜率: <b class="${(d1.win_rate||0)>50?'up':'down'}">${d1.win_rate!=null?d1.win_rate+'%':'--'}</b></div>
+      <div>D+1 均盈亏: <b class="${(d1.avg_pnl||0)>0?'up':'down'}">${d1.avg_pnl!=null?(d1.avg_pnl>0?'+':'')+d1.avg_pnl+'%':'--'}</b></div>
+      <div>D+5 胜率: <b class="${(d5.win_rate||0)>50?'up':'down'}">${d5.win_rate!=null?d5.win_rate+'%':'--'}</b></div>
+      <div>D+5 均盈亏: <b class="${(d5.avg_pnl||0)>0?'up':'down'}">${d5.avg_pnl!=null?(d5.avg_pnl>0?'+':'')+d5.avg_pnl+'%':'--'}</b></div>
+    </div></div>`;
+
+  // 按推荐等级
+  if (s.by_rec_level && Object.keys(s.by_rec_level).length) {
+    html += '<div class="card"><div class="card-title">按推荐等级</div>';
+    Object.entries(s.by_rec_level).forEach(([lv, data]) => {
+      const ld1 = data.d1 || {};
+      html += `<div class="risk-row"><span class="risk-label">${lv} (${ld1.count||0}条)</span>
+        <span class="risk-val">D+1胜率 ${ld1.win_rate!=null?ld1.win_rate+'%':'--'} | 均${ld1.avg_pnl!=null?(ld1.avg_pnl>0?'+':'')+ld1.avg_pnl+'%':'--'}</span></div>`;
+    });
+    html += '</div>';
+  }
+  $('#trades-summary').innerHTML = html;
+
+  // 最近推荐列表
+  if (!trades.length) {
+    $('#trades-list').innerHTML = '<div class="card" style="text-align:center;color:var(--text2);padding:20px">暂无推荐记录</div>';
+    return;
+  }
+  let listHtml = '<div class="card"><div class="card-title">最近推荐</div>';
+  trades.slice(-20).reverse().forEach(t => {
+    const d1p = t.d1_pnl_pct!=null ? (t.d1_pnl_pct>0?'+':'')+t.d1_pnl_pct.toFixed(2)+'%' : '待定';
+    const d5p = t.d5_pnl_pct!=null ? (t.d5_pnl_pct>0?'+':'')+t.d5_pnl_pct.toFixed(2)+'%' : '待定';
+    const d1c = t.d1_pnl_pct>0?'up':t.d1_pnl_pct<0?'down':'neutral';
+    const d5c = t.d5_pnl_pct>0?'up':t.d5_pnl_pct<0?'down':'neutral';
+    listHtml += `<div style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600">${t.name}(${t.code})</div>
+        <div style="font-size:11px;color:var(--text2)">${t.rec_date} | ${t.rec_type} | ${t.rec_level} | ${t.price.toFixed(2)}</div>
+      </div>
+      <div style="text-align:right;min-width:90px">
+        <div class="${d1c}" style="font-size:12px">D+1: ${d1p}</div>
+        <div class="${d5c}" style="font-size:12px">D+5: ${d5p}</div>
+      </div>
+    </div>`;
+  });
+  listHtml += '</div>';
+  $('#trades-list').innerHTML = listHtml;
 }
 
 // ── 初始化 ──

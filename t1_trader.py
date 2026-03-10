@@ -461,7 +461,7 @@ def evaluate_fundamentals(fund_info):
     3. 估值合理性 (0-15)：PE + PB
     """
     if not fund_info:
-        return 15, {}, ""  # 无数据给中性分
+        return 8, {}, ""  # 无数据给低分（未知 ≠ 中性，应保守）
 
     score = 0
     details = {}
@@ -492,7 +492,7 @@ def evaluate_fundamentals(fund_info):
         else:
             growth_s = 2; details["成长"] = f"营收{rev:+.0f}%"
     else:
-        growth_s = 8; details["成长"] = "无数据"
+        growth_s = 3; details["成长"] = "无数据(保守)"
     score += growth_s
 
     # 2. 盈利能力 (0-15)
@@ -512,7 +512,7 @@ def evaluate_fundamentals(fund_info):
         else:
             profit_s += 0; details["ROE"] = f"{roe:.1f}%(亏损)"
     else:
-        profit_s += 4; details["ROE"] = "无数据"
+        profit_s += 2; details["ROE"] = "无数据"
 
     if margin is not None:
         if margin > 40:
@@ -542,7 +542,7 @@ def evaluate_fundamentals(fund_info):
     elif pe is not None and pe < 0:
         val_s += 0; details["PE"] = "亏损"
     else:
-        val_s += 5; details["PE"] = "无数据"
+        val_s += 2; details["PE"] = "无数据"
 
     if pb is not None and pb > 0:
         if pb < 2:
@@ -1039,55 +1039,73 @@ def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit
     atr = recent_20["振幅"].mean()  # 平均振幅
     recent_5 = kline.tail(5)
 
-    # 动态止损：根据波动率调整
+    # ★ 动态止损：基于ATR倍数（标准风控是1.5-2倍ATR）
+    # 高波动股止损不能太紧（否则被震出），低波动股止损不能太松（否则亏损扩大）
+    atr_stop = atr * 0.8  # 约0.8倍ATR作为止损幅度
     if atr > 6:
-        stop_pct = -1.5  # 高波动股票紧止损
+        stop_pct = -max(2.5, min(atr_stop, 4.0))   # 高波动：-2.5%~-4%
     elif atr > 4:
-        stop_pct = -2.0
+        stop_pct = -max(2.0, min(atr_stop, 3.0))   # 中波动：-2%~-3%
     else:
-        stop_pct = -2.5  # 低波动可以宽一点
+        stop_pct = -max(1.5, min(atr_stop, 2.5))   # 低波动：-1.5%~-2.5%
+
+    # ★ 结合支撑位优化止损：如果支撑位在止损范围内，以支撑位下方为止损
+    support_20 = kline.tail(20)["最低"].min()
+    support_pct = (support_20 - price) / price * 100
+    if -6 < support_pct < stop_pct:
+        # 支撑位比计算止损更近，用支撑位下方0.5%
+        stop_pct = support_pct - 0.5
 
     stop_loss = price * (1 + stop_pct / 100)
 
-    # 动态止盈：三级止盈
-    tp1_pct = max(2.0, atr * 0.5)   # 第一目标：半个ATR
-    tp2_pct = max(3.5, atr * 0.8)   # 第二目标
-    tp3_pct = max(5.0, atr * 1.2)   # 激进目标
+    # ★ 动态止盈：基于ATR倍数，确保盈亏比 >= 2:1
+    min_tp1 = abs(stop_pct) * 1.5  # 第一目标至少是止损的1.5倍
+    tp1_pct = max(min_tp1, atr * 0.6)
+    tp2_pct = max(min_tp1 * 1.8, atr * 1.0)
+    tp3_pct = max(min_tp1 * 2.5, atr * 1.5)
 
     tp1 = price * (1 + tp1_pct / 100)
     tp2 = price * (1 + tp2_pct / 100)
     tp3 = price * (1 + tp3_pct / 100)
 
-    # 支撑/压力
-    support = recent_5["最低"].min()
-    resistance = recent_5["最高"].max()
+    # 支撑/压力（用20日范围，比5日更可靠）
+    support = kline.tail(20)["最低"].min()
+    resistance = kline.tail(20)["最高"].max()
 
-    # 仓位计算
-    base_position = 40  # 基础仓位40%
+    # ★ 仓位计算 - 更保守的基础仓位，避免过度集中
+    base_position = 30  # 基础仓位30%（比之前的40%更保守）
     if stock_score >= 180:
-        base_position = 50
+        base_position = 40
     elif stock_score >= 150:
-        base_position = 45
-    elif stock_score >= 120:
         base_position = 35
+    elif stock_score >= 120:
+        base_position = 30
     else:
-        base_position = 25
+        base_position = 20
 
-    # 市场环境调整
+    # 市场环境调整（使用乘数而非加减法，避免极端偏移）
+    env_mult = 1.0
     if sentiment_score >= 10:
-        base_position += 10
+        env_mult += 0.15
     elif sentiment_score <= 3:
-        base_position -= 15
+        env_mult -= 0.25
 
     if northbound_total > 30e4:
-        base_position += 5
+        env_mult += 0.1
     elif northbound_total < -30e4:
-        base_position -= 10
+        env_mult -= 0.2
 
     if limit_down > limit_up and limit_down > 30:
-        base_position -= 10
+        env_mult -= 0.2
 
-    position = max(10, min(base_position, 50))  # 限制在10%-50%
+    # ★ 波动率调整：高波动降仓
+    if atr > 6:
+        env_mult -= 0.15
+    elif atr > 5:
+        env_mult -= 0.08
+
+    base_position = int(base_position * max(env_mult, 0.4))
+    position = max(10, min(base_position, 40))  # ★ 上限从50%降至40%
 
     # 大盘股风控调整
     largecap_label = ""
@@ -1139,6 +1157,83 @@ def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit
     }
 
 
+def calc_position_and_risk_t5(tech_score, position_mult, sentiment_score, northbound_total,
+                               limit_up, limit_down, price, kline, largecap_adj=None):
+    """
+    T+5 波段风控：比T+1更宽的止损止盈，带移动止损
+    """
+    latest = kline.iloc[-1]
+    recent_20 = kline.tail(20)
+    atr = recent_20["振幅"].mean()
+    recent_10 = kline.tail(10)
+
+    # T+5止损：比T+1宽（-3%~-5%）
+    if atr > 6:
+        stop_pct = -3.0
+    elif atr > 4:
+        stop_pct = -4.0
+    else:
+        stop_pct = -5.0
+
+    stop_loss = price * (1 + stop_pct / 100)
+
+    # T+5止盈：三级，目标更高
+    tp1_pct = max(3.0, atr * 1.0)
+    tp2_pct = max(5.0, atr * 2.0)
+    tp3_pct = max(8.0, atr * 3.0)
+
+    tp1 = price * (1 + tp1_pct / 100)
+    tp2 = price * (1 + tp2_pct / 100)
+    tp3 = price * (1 + tp3_pct / 100)
+
+    # 支撑/压力（看10天）
+    support = recent_10["最低"].min()
+    resistance = recent_10["最高"].max()
+
+    # 仓位：基于技术分+倍率
+    base_position = 30
+    if tech_score >= 60:
+        base_position = 40
+    elif tech_score >= 45:
+        base_position = 35
+    # 基本面/聪明钱倍率调整
+    base_position = int(base_position * position_mult)
+
+    # 市场环境
+    if sentiment_score >= 10:
+        base_position += 5
+    elif sentiment_score <= 3:
+        base_position -= 10
+    if northbound_total < -30e4:
+        base_position -= 5
+
+    position = max(10, min(base_position, 40))  # T+5最高40%
+
+    if largecap_adj:
+        position = min(position, largecap_adj.get("仓位上限", position))
+
+    risk_factors = 0
+    if atr > 5: risk_factors += 1
+    if sentiment_score <= 4: risk_factors += 1
+    if northbound_total < -20e4: risk_factors += 1
+    if limit_down > limit_up: risk_factors += 1
+
+    risk_level = "高风险" if risk_factors >= 3 else "中等风险" if risk_factors >= 2 else \
+                 "低风险" if risk_factors >= 1 else "极低风险"
+
+    return {
+        "仓位": position,
+        "止损价": stop_loss, "止损幅度": stop_pct,
+        "止盈一": tp1, "止盈一幅度": tp1_pct,
+        "止盈二": tp2, "止盈二幅度": tp2_pct,
+        "止盈三": tp3, "止盈三幅度": tp3_pct,
+        "移动止损": "TP1达成→止损移至成本价；TP2达成→止损移至TP1",
+        "时间止损": "第5天收盘无条件清仓",
+        "支撑位": support, "压力位": resistance,
+        "ATR": atr, "风险等级": risk_level,
+    }
+
+
 # ============================================================
 # 技术指标计算
 # ============================================================
@@ -1159,19 +1254,27 @@ def calc_macd(df, fast=12, slow=26, signal=9):
 def calc_kdj(df, n=9, m1=3, m2=3):
     low_n = df["最低"].rolling(n).min()
     high_n = df["最高"].rolling(n).max()
-    rsv = (df["收盘"] - low_n) / (high_n - low_n) * 100
+    denom = high_n - low_n
+    # ★ 修复：当最高=最低(涨停/跌停全天)时分母为0，RSV设为50
+    rsv = np.where(denom > 0, (df["收盘"] - low_n) / denom * 100, 50)
+    rsv = pd.Series(rsv, index=df.index)
     rsv = rsv.fillna(50)
     df["K"] = rsv.ewm(com=m1-1, adjust=False).mean()
     df["D"] = df["K"].ewm(com=m2-1, adjust=False).mean()
     df["J"] = 3 * df["K"] - 2 * df["D"]
     return df
 
-def calc_rsi(df, period=6):
+def calc_rsi(df, period=6, period2=14):
     delta = df["收盘"].diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     rs = gain / loss.replace(0, np.nan)
     df[f"RSI{period}"] = 100 - (100 / (1 + rs))
+    # ★ 增加RSI14作为趋势确认
+    gain14 = delta.where(delta > 0, 0).rolling(period2).mean()
+    loss14 = (-delta.where(delta < 0, 0)).rolling(period2).mean()
+    rs14 = gain14 / loss14.replace(0, np.nan)
+    df[f"RSI{period2}"] = 100 - (100 / (1 + rs14))
     return df
 
 def calc_volume_ratio(df):
@@ -1403,7 +1506,11 @@ INDUSTRY_COMMODITY_MAP = {
     "化工": ["原油"], "基础化工": ["原油"],
     "有色金属": ["铜", "黄金"], "贵金属": ["黄金"], "铜": ["铜"],
     "农业": ["大豆"], "农林牧渔": ["大豆"], "养殖": ["大豆"],
-    "煤炭": ["原油"], "钢铁": ["铜"],
+    "煤炭": ["原油"],  # 煤炭受油价影响（替代品逻辑）
+    "钢铁": ["铜", "原油"],  # 钢铁受工业金属和能源成本影响
+    "电力": ["原油"],  # 火电受燃料成本影响
+    "航空": ["原油"],  # 航油成本
+    "航运": ["原油"],  # 燃油成本
 }
 
 # 大宗商品名 → 关联的行业关键词（用于模糊匹配股票名称）
@@ -2120,11 +2227,17 @@ def detect_signals(df, capital_info=None):
 
     # === RSI ===
     rsi = latest.get("RSI6", np.nan)
-    signals["RSI_回升"] = (not pd.isna(rsi) and 30 <= rsi <= 50)
+    rsi14 = latest.get("RSI14", np.nan)
+    prev_rsi = prev.get("RSI6", np.nan) if not pd.isna(prev.get("RSI6", np.nan)) else rsi
+    # ★ RSI回升需要确认：RSI6在回升区间 + RSI比前日上升（动量确认）
+    signals["RSI_回升"] = (not pd.isna(rsi) and 30 <= rsi <= 50
+                          and not pd.isna(prev_rsi) and rsi > prev_rsi)
     signals["RSI_超卖"] = (not pd.isna(rsi) and 20 <= rsi < 30)
     signals["RSI_强势"] = (not pd.isna(rsi) and 50 < rsi <= 70)
     signals["RSI_极度超卖"] = (not pd.isna(rsi) and rsi < 20)
     signals["RSI_偏高"] = (not pd.isna(rsi) and rsi > 70)
+    # ★ RSI14趋势确认标记（用于其他信号增强）
+    signals["RSI14_超卖确认"] = (not pd.isna(rsi14) and rsi14 < 35)
     signals["RSI值"] = rsi if not pd.isna(rsi) else 50
 
     # === 均线 ===
@@ -2182,25 +2295,50 @@ def detect_signals(df, capital_info=None):
     else:
         signals["主力净流入占比"] = 0
 
+    # ★ 底部背离检测：价格创新低但RSI/MACD不创新低 → 强烈反转信号
+    signals["底部背离"] = False
+    if len(df) >= 20:
+        recent_20 = df.tail(20)
+        price_low_idx = recent_20["收盘"].idxmin()
+        # 检查最近5天价格是否接近20日新低
+        recent_5_low = df.tail(5)["收盘"].min()
+        low_20 = recent_20["收盘"].min()
+        near_low = (recent_5_low <= low_20 * 1.02)  # 价格在20日低点2%以内
+        if near_low and not pd.isna(rsi):
+            # 价格接近新低但RSI比上次低点时更高 → 底部背离
+            rsi_at_price_low = recent_20.loc[price_low_idx].get("RSI6", rsi)
+            if not pd.isna(rsi_at_price_low) and rsi > rsi_at_price_low + 3:
+                signals["底部背离"] = True
+
+    # ★ 量价背离检测：价格下跌但成交量萎缩 → 抛压减轻
+    signals["量价背离_抛压衰竭"] = False
+    if len(df) >= 10:
+        recent_10 = df.tail(10)
+        price_falling = recent_10["收盘"].iloc[-1] < recent_10["收盘"].iloc[0]
+        vol_shrinking = recent_10["成交量"].iloc[-3:].mean() < recent_10["成交量"].iloc[:3].mean() * 0.7
+        if price_falling and vol_shrinking:
+            signals["量价背离_抛压衰竭"] = True
+
     return signals
 
 
 # 默认权重（后续会被校准回测覆盖）
+# ★ 基于回测数据修正：低胜率信号(<49%)降权/归零，高胜率信号(>53%)提权
 DEFAULT_WEIGHTS = {
     # MACD — 互斥，取最高
-    "MACD_金叉": 18, "MACD_红柱放大": 12, "MACD_即将金叉": 7, "MACD_红柱": 4,
+    "MACD_金叉": 12, "MACD_红柱放大": 3, "MACD_即将金叉": 8, "MACD_红柱": 1,
     # KDJ — 互斥
-    "KDJ_超卖金叉": 15, "KDJ_J超卖": 12, "KDJ_多头": 7,
+    "KDJ_超卖金叉": 12, "KDJ_J超卖": 14, "KDJ_多头": 2,
     # RSI — 互斥
-    "RSI_回升": 12, "RSI_超卖": 10, "RSI_强势": 8, "RSI_极度超卖": 8, "RSI_偏高": 2,
+    "RSI_回升": 12, "RSI_超卖": 10, "RSI_强势": 3, "RSI_极度超卖": 14, "RSI_偏高": 0,
     # 均线 — 互斥
-    "MA_多头排列": 10, "MA_短期多头": 7, "MA_突破MA5": 8, "MA_站上MA5": 4,
+    "MA_多头排列": 3, "MA_短期多头": 3, "MA_突破MA5": 10, "MA_站上MA5": 1,
     # 布林 — 互斥
-    "BOLL_触及下轨": 5, "BOLL_中轨下方": 2,
-    # 量价 — 互斥
-    "量价_放量上涨": 20, "量价_量升价涨": 15, "量价_放量横盘": 10, "量价_缩量上涨": 8, "量价_严重缩量": 2,
-    # 形态 — 互斥（阳包阴 > 锤子线 > 早晨之星 > 阳线）
-    "形态_阳包阴": 10, "形态_锤子线": 8, "形态_早晨之星": 7, "形态_阳线": 2,
+    "BOLL_触及下轨": 15, "BOLL_中轨下方": 6,
+    # 量价 — 互斥（★放量上涨回测胜率仅46%，大幅降权）
+    "量价_放量上涨": 4, "量价_量升价涨": 3, "量价_放量横盘": 3, "量价_缩量上涨": 5, "量价_严重缩量": 5,
+    # 形态 — 互斥（★阳包阴回测胜率仅47%，降权）
+    "形态_阳包阴": 2, "形态_锤子线": 3, "形态_早晨之星": 3, "形态_阳线": 1,
     # 资金 — 互斥
     "资金_大幅流入": 30, "资金_明显流入": 24, "资金_温和流入": 18, "资金_小幅流入": 10,
 }
@@ -2209,7 +2347,7 @@ DEFAULT_WEIGHTS = {
 SIGNAL_GROUPS = {
     "MACD": ["MACD_金叉", "MACD_红柱放大", "MACD_即将金叉", "MACD_红柱"],
     "KDJ": ["KDJ_超卖金叉", "KDJ_J超卖", "KDJ_多头"],
-    "RSI": ["RSI_回升", "RSI_超卖", "RSI_强势", "RSI_极度超卖", "RSI_偏高"],
+    "RSI": ["RSI_极度超卖", "RSI_超卖", "RSI_回升", "RSI_强势", "RSI_偏高"],
     "MA": ["MA_多头排列", "MA_短期多头", "MA_突破MA5", "MA_站上MA5"],
     "BOLL": ["BOLL_触及下轨", "BOLL_中轨下方"],
     "量价": ["量价_放量上涨", "量价_量升价涨", "量价_放量横盘", "量价_缩量上涨", "量价_严重缩量"],
@@ -2292,7 +2430,7 @@ def calc_weekly_trend(df):
         # 重采样为周线
         wdf = df.copy()
         wdf.index = pd.to_datetime(wdf["日期"])
-        weekly = wdf.resample("W").agg({
+        weekly = wdf.resample("W-FRI").agg({
             "开盘": "first", "最高": "max", "最低": "min",
             "收盘": "last", "成交量": "sum"
         }).dropna()
@@ -2407,11 +2545,11 @@ def calc_calendar_adjustment():
     return adj, "；".join(labels) if labels else ""
 
 
-# ── 高胜率信号白名单（回测胜率>53%的信号）──
+# ── 高胜率信号白名单（回测胜率>53%的信号 + 逻辑强信号）──
 HIGH_WINRATE_SIGNALS = {
     "BOLL_触及下轨",     # 59.9%
     "KDJ_J超卖",         # 54.5%
-    "RSI_回升",           # 54.0%
+    "RSI_回升",           # 54.0%（现已加动量确认）
     "RSI_极度超卖",       # 53.4%
     "RSI_超卖",           # 53.0%
     "MA_突破MA5",         # 52.9%
@@ -2419,6 +2557,8 @@ HIGH_WINRATE_SIGNALS = {
     "MACD_即将金叉",      # 52.1%
     "KDJ_超卖金叉",       # 51.6%
     "量价_严重缩量",      # 51.4%
+    "底部背离",           # 新增：底部背离是经典强反转信号
+    "量价背离_抛压衰竭",  # 新增：抛压衰竭是底部确认信号
 }
 
 # ── 低胜率信号（回测<49%，不应给正分）──
@@ -2429,10 +2569,15 @@ LOW_WINRATE_SIGNALS = {
     "MACD_红柱放大",      # 48.1%
     "MA_多头排列",        # 48.1%
     "MA_站上MA5",         # 48.1%
-    "RSI_偏高",           # 47.4%
+    "RSI_偏高",           # 47.4%（实际应为看空信号）
+    "RSI_强势",           # 48.1%
     "形态_阳包阴",        # 47.5%
-    "量价_放量上涨",      # 45.8%
-    "量价_放量横盘",      # 42.9%
+    "形态_锤子线",        # 47.6%
+    "量价_放量上涨",      # 45.8%（★最容易误导的信号之一）
+    "量价_放量横盘",      # 42.9%（最差信号）
+    "量价_量升价涨",      # 46.8%
+    "MACD_金叉",          # 47.7%
+    "MA_短期多头",        # 49.3%
 }
 
 
@@ -2482,12 +2627,28 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     tech_score, fired = apply_weights(signals, calibrated_weights)
     score = tech_score
 
+    # ★ 底部背离额外加分（强烈反转信号）
+    if signals.get("底部背离"):
+        score += 15
+        fired.append("底部背离")
+
+    # ★ RSI14超卖确认：当RSI6超卖 + RSI14也超卖 → 额外加分
+    if signals.get("RSI14_超卖确认") and any(s in fired for s in ["RSI_极度超卖", "RSI_超卖"]):
+        score += 5
+
+    # ★ 量价背离加分
+    if signals.get("量价背离_抛压衰竭"):
+        score += 8
+        fired.append("量价背离_抛压衰竭")
+
     # === 信号质量评估 ===
     sig_quality, high_count, low_count = calc_signal_quality(fired)
 
-    # 低胜率信号惩罚
+    # ★ 低胜率信号惩罚加强
     if low_count >= 3 and high_count == 0:
-        score -= 10  # 全是低胜率信号，扣分
+        score -= 15  # 全是低胜率信号，重扣（从-10加到-15）
+    elif low_count >= 2 and high_count == 0:
+        score -= 8   # ★ 新增：2个低胜率也要扣分
 
     # 高胜率信号奖励
     if high_count >= 3:
@@ -2536,6 +2697,8 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
         "资金_明显流入": ("资金", f"明显流入({signals.get('主力净流入占比', 0):.1f}%)", True),
         "资金_温和流入": ("资金", f"温和流入({signals.get('主力净流入占比', 0):.1f}%)", True),
         "资金_小幅流入": ("资金", f"小幅流入({signals.get('主力净流入占比', 0):.1f}%)", False),
+        "底部背离": ("背离", "底部背离(强反转)", True),
+        "量价背离_抛压衰竭": ("背离", "抛压衰竭", True),
     }
     # 未触发的维度设为 "-"
     seen_dims = set()
@@ -2709,26 +2872,35 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
         else:
             details["宏观趋势"] = f"逆势{macro_adj}"
 
-    # === 大盘趋势研判（熊市小扣，牛市不加）===
+    # ★ 大盘趋势研判（熊市重扣，牛市小加 — 不对称但比之前好）
     if market_regime_adj < 0:
-        score += max(market_regime_adj, -8)
-        details["大盘趋势"] = f"偏空({max(market_regime_adj, -8)})"
+        adj = max(market_regime_adj, -12)  # ★ 熊市扣分上限从-8提到-12
+        score += adj
+        details["大盘趋势"] = f"偏空({adj})"
     elif market_regime_adj > 0:
-        details["大盘趋势"] = "偏多"
+        adj = min(market_regime_adj, 5)  # ★ 牛市也给加分，但上限5
+        score += adj
+        details["大盘趋势"] = f"偏多(+{adj})"
 
-    # === 周线趋势确认（空头扣分，多头不加）===
+    # ★ 周线趋势确认（空头重扣，多头小加）
     if weekly_trend_adj < 0:
-        score += max(weekly_trend_adj, -5)
-        details["周线"] = f"空头({max(weekly_trend_adj, -5)})"
+        adj = max(weekly_trend_adj, -8)  # ★ 从-5加到-8
+        score += adj
+        details["周线"] = f"空头({adj})"
     elif weekly_trend_adj > 0:
-        details["周线"] = "多头"
+        adj = min(weekly_trend_adj, 3)
+        score += adj
+        details["周线"] = f"多头(+{adj})"
 
-    # === 历史趋势形态（下降反弹小扣）===
+    # ★ 历史趋势形态（下降反弹重扣）
     if trend_context_adj < 0:
-        score += max(trend_context_adj, -5)
-        details["趋势形态"] = f"不利({max(trend_context_adj, -5)})"
+        adj = max(trend_context_adj, -8)  # ★ 从-5加到-8
+        score += adj
+        details["趋势形态"] = f"不利({adj})"
     elif trend_context_adj > 0:
-        details["趋势形态"] = "上升回调"
+        adj = min(trend_context_adj, 5)
+        score += adj
+        details["趋势形态"] = f"上升回调(+{adj})"
 
     # === 日历效应（周五扣分，其他不动）===
     if calendar_adj < -5:
@@ -2737,8 +2909,150 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     elif calendar_adj > 0:
         details["日历"] = "有利"
 
+    # ★ 利空信号惩罚（买入前检查明确看空信号）
+    today_chg = signals.get("涨跌幅", 0)
+    bearish_count = 0
+    if signals.get("MA_弱势"):
+        bearish_count += 1
+    if signals.get("资金_流出"):
+        bearish_count += 1
+    if signals.get("RSI_偏高"):
+        bearish_count += 1
+    if today_chg < -3:  # 当日大跌
+        bearish_count += 1
+
+    if bearish_count >= 3:
+        score -= 15
+        details["利空叠加"] = f"{bearish_count}项看空"
+    elif bearish_count >= 2:
+        score -= 8
+        details["利空叠加"] = f"{bearish_count}项看空"
+
     reason_str = "；".join(reasons) if reasons else "信号不足"
     return score, details, reason_str
+
+
+# ============================================================
+# T+5 波段评分引擎 — 技术面独立门槛 + 基本面调仓
+# ============================================================
+
+TECH_GATE_THRESHOLD = 42  # ★ 技术面独立门槛从35提到42（T+5持仓期更长，需要更强信号）
+
+def evaluate_signals_gated(df, capital_info=None, sector_score=0, sentiment_score=0,
+                           fundamental_score=0, fundamental_details=None,
+                           extra_score=0, extra_details=None,
+                           calibrated_weights=None, golden_combos=None,
+                           market_regime_adj=0, weekly_trend_adj=0,
+                           trend_context_adj=0, calendar_adj=0):
+    """
+    T+5 门控评分：技术面必须独立达标，基本面/聪明钱只影响仓位倍率
+    返回 (tech_score, position_mult, details, reason_str, passed_gate)
+    """
+    if len(df) < 30:
+        return 0, 1.0, {}, "数据不足", False
+
+    # === 技术面评分（门槛）===
+    signals = detect_signals(df, capital_info)
+    tech_score, fired = apply_weights(signals, calibrated_weights)
+    sig_quality, high_count, low_count = calc_signal_quality(fired)
+
+    # 低胜率惩罚
+    if low_count >= 3 and high_count == 0:
+        tech_score -= 10
+
+    # 高胜率奖励
+    if high_count >= 3:
+        tech_score += 12
+    elif high_count >= 2:
+        tech_score += 6
+
+    # 黄金组合
+    combo_bonus = 0
+    matched_combo = ""
+    has_golden = False
+    if golden_combos and fired:
+        fired_set = set(fired)
+        for combo in golden_combos:
+            combo_sigs = set(combo.get("signals", []))
+            if combo_sigs.issubset(fired_set):
+                wr = combo.get("win_rate", 0)
+                bonus = int((wr - 0.55) * 100)
+                if bonus > combo_bonus:
+                    combo_bonus = min(bonus, 30)
+                    matched_combo = f"黄金组合({wr:.0%})"
+                    has_golden = True
+    tech_score += combo_bonus
+
+    # 趋势过滤（只扣不加）
+    if market_regime_adj < 0:
+        tech_score += max(market_regime_adj, -8)
+    if weekly_trend_adj < 0:
+        tech_score += max(weekly_trend_adj, -5)
+    if trend_context_adj < 0:
+        tech_score += max(trend_context_adj, -5)
+    if calendar_adj < -5:
+        tech_score -= 5
+
+    # === 技术面门槛判断 ===
+    passed_gate = tech_score >= TECH_GATE_THRESHOLD and (high_count >= 1 or has_golden)
+
+    # === 基本面/聪明钱 → 仓位倍率（不影响买入决策）===
+    fund_s = min(fundamental_score, 50)
+    ext_s = min(max(extra_score, 0), 80)
+    # 基本面倍率: 0-50分 → 0.7x-1.3x
+    fund_mult = 0.7 + (fund_s / 50) * 0.6
+    # 聪明钱倍率: 0-80分 → 0.7x-1.3x
+    smart_mult = 0.7 + (ext_s / 80) * 0.6
+    position_mult = round((fund_mult + smart_mult) / 2, 2)
+    position_mult = max(0.5, min(position_mult, 1.5))
+
+    # === 构建详情 ===
+    details = {}
+    latest = df.iloc[-1]
+    sig_label_map = {
+        "MACD_金叉": ("MACD", "当日金叉"), "MACD_红柱放大": ("MACD", "红柱放大"),
+        "MACD_即将金叉": ("MACD", "即将金叉"), "MACD_红柱": ("MACD", "红柱"),
+        "KDJ_超卖金叉": ("KDJ", "超卖金叉"), "KDJ_J超卖": ("KDJ", f"J超卖({latest['J']:.0f})"),
+        "KDJ_多头": ("KDJ", "多头"),
+        "RSI_回升": ("RSI", f"回升({signals.get('RSI值', 0):.0f})"),
+        "RSI_超卖": ("RSI", f"超卖({signals.get('RSI值', 0):.0f})"),
+        "RSI_极度超卖": ("RSI", f"极度超卖({signals.get('RSI值', 0):.0f})"),
+        "RSI_强势": ("RSI", f"强势({signals.get('RSI值', 0):.0f})"),
+        "MA_多头排列": ("均线", "多头排列"), "MA_短期多头": ("均线", "短期多头"),
+        "MA_突破MA5": ("均线", "突破MA5"), "MA_站上MA5": ("均线", "站上MA5"),
+        "BOLL_触及下轨": ("布林", "触及下轨"), "BOLL_中轨下方": ("布林", "中轨下方"),
+    }
+    reasons = []
+    seen_dims = set()
+    for sig in fired:
+        if sig in sig_label_map:
+            dim, label = sig_label_map[sig]
+            details[dim] = label
+            seen_dims.add(dim)
+            reasons.append(label)
+
+    if has_golden:
+        details["黄金组合匹配"] = True
+        details["组合"] = matched_combo
+        reasons.append(matched_combo)
+    else:
+        details["黄金组合匹配"] = False
+
+    details["技术门槛"] = f"{'PASS' if passed_gate else 'FAIL'}({tech_score:.0f}/{TECH_GATE_THRESHOLD})"
+    details["信号质量"] = f"{'A' if high_count >= 2 else 'B' if high_count >= 1 else 'C'}级({high_count}个高胜率)"
+    details["仓位倍率"] = f"{position_mult:.1f}x(基本面{fund_s}/50 聪明钱{ext_s}/80)"
+    if weekly_trend_adj > 0:
+        details["周线"] = "多头"
+    elif weekly_trend_adj < 0:
+        details["周线"] = "空头"
+    if trend_context_adj > 0:
+        details["趋势形态"] = "上升回调"
+        reasons.append("上升趋势回调")
+    elif trend_context_adj < 0:
+        details["趋势形态"] = "下降反弹"
+
+    reason_str = "；".join(reasons) if reasons else "信号不足"
+    return tech_score, position_mult, details, reason_str, passed_gate
 
 
 # ============================================================
@@ -4389,6 +4703,430 @@ def go_decision():
     print("=" * 65)
     print()
 
+    # 记录推荐
+    try:
+        from trade_tracker import record_recommendation
+        for s in selected:
+            record_recommendation("T+1", s["代码"], s["名称"], s["最新价"],
+                                   s["评分"], s.get("推荐等级", ""), s["risk"])
+    except Exception:
+        pass
+
+
+# ============================================================
+# T+5 波段决策（持有2-5天，技术面独立门槛）
+# ============================================================
+
+def go5_decision():
+    """T+5 波段决策：技术面独立达标 + 基本面/聪明钱调仓位"""
+
+    print()
+    print("=" * 65)
+    print("  T+5 波段决策系统")
+    print("  " + time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 65)
+
+    cal_weights, cal_threshold, cal_combos = load_calibrated_weights()
+    if cal_weights:
+        print(f"  [校准模式] 技术门槛={TECH_GATE_THRESHOLD}")
+    else:
+        print(f"  [默认模式] 技术门槛={TECH_GATE_THRESHOLD}")
+
+    # ── 市场环境 ──
+    print()
+    print("[1/8] 市场环境检测...")
+    money_effect = calc_money_effect()
+    sentiment_score, sentiment_info = get_sentiment_score()
+    market_regime, regime_adj, regime_label = calc_market_regime()
+    calendar_adj, calendar_label = calc_calendar_adjustment()
+    print(f"  {sentiment_info} → 情绪分: {sentiment_score}/15")
+    if regime_label:
+        print(f"  大盘趋势: {regime_label}")
+    if calendar_label:
+        print(f"  日历效应: {calendar_label}")
+
+    # ── 新闻 ──
+    print()
+    print("[2/8] 扫描新闻...")
+    news = fetch_news()
+    global_news = fetch_global_news()
+    all_news = news + global_news
+    news_score, hot_concepts, key_headlines, veto_industries = analyze_news_sentiment(all_news)
+    global_risk_score, trend_industries, global_headlines = analyze_global_news(global_news)
+    news_mood = "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空"
+    print(f"  新闻情绪: {news_mood}")
+
+    # ── 板块/资金 ──
+    print()
+    print("[3/8] 获取板块/龙虎榜/北向/融资...")
+    hot_sectors = get_hot_sectors()
+    billboard_data = fetch_billboard()
+    nb_total, nb_info = fetch_northbound_flow()
+    margin_data = fetch_margin_data_top()
+    limit_up, limit_down = count_limit_up()
+    limit_up_pool = fetch_limit_up_pool()
+    shareholder_data = fetch_shareholder_increase()
+    industry_data = fetch_industry_prosperity()
+    print(f"  板块: {', '.join(list(hot_sectors)[:5])}" if hot_sectors else "  板块: 无数据")
+    print(f"  龙虎榜 {len(billboard_data)} 只 | 涨停 {limit_up} 跌停 {limit_down}")
+
+    # ── 股票列表+资金 ──
+    print()
+    print("[4/8] 获取股票列表+资金...")
+    capital_rank = fetch_capital_flow_rank(top_n=300)
+    fund_batch = fetch_fundamentals_batch()
+    stock_list = fetch_stock_list_sina()
+    if stock_list.empty:
+        print("[错误] 无法获取股票列表")
+        return
+
+    # T+5 预筛选（比T+1更宽）
+    stock_list = stock_list[
+        (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 100) &
+        (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 5) &  # 不追涨杀跌
+        (stock_list["换手率"] >= 1.5) & (stock_list["量比"] >= 0.6)
+    ]
+    capital_codes = set(capital_rank.keys())
+    bb_codes = set(billboard_data.keys())
+    p1 = stock_list[stock_list["代码"].isin(capital_codes & bb_codes)]["代码"].tolist()
+    p2 = stock_list[stock_list["代码"].isin(capital_codes - bb_codes)]["代码"].tolist()
+    p3 = stock_list[~stock_list["代码"].isin(capital_codes | bb_codes)]["代码"].tolist()[:300]
+    analyze_list = p1 + p2 + p3
+    code_to_row = stock_list.set_index("代码").to_dict("index")
+    print(f"  全市场 {len(stock_list)} → 预筛选 {len(analyze_list)} 只")
+
+    # ── 逐只评分 ──
+    print()
+    print("[5/8] T+5 门控评分分析...")
+
+    results = []
+
+    def analyze_one_t5(code):
+        kl = fetch_kline(code, days=120)
+        if kl.empty or len(kl) < 60:
+            return None
+        kl = calc_all_indicators(kl)
+        cap_info = capital_rank.get(code)
+        sec_score = 10 if code in capital_codes else 3
+        fi = fund_batch.get(code, {})
+        fs, fd, fr = evaluate_fundamentals(fi)
+        stock_ind = ""
+        if code in billboard_data or code in limit_up_pool or code in shareholder_data:
+            stock_ind = get_stock_industry(code)
+        row = code_to_row.get(code, {})
+        name = str(row.get("名称", ""))
+
+        # 新闻否决
+        if veto_industries:
+            if stock_ind and any(vi in stock_ind for vi in veto_industries):
+                return None
+            if any(vi in name for vi in veto_industries):
+                return None
+
+        # 周线趋势 + 历史形态
+        wt_adj, _ = calc_weekly_trend(kl)
+        tc_adj, _ = classify_trend_context(kl)
+
+        es, ed, er = evaluate_extra_dimensions(
+            code, billboard_data, margin_data, nb_total, limit_up, limit_down,
+            limit_up_pool, {}, shareholder_data, industry_data, stock_ind)
+
+        tech_score, pos_mult, d, r, passed = evaluate_signals_gated(
+            kl, cap_info, sec_score, sentiment_score, fs, fd, es, ed,
+            calibrated_weights=cal_weights, golden_combos=cal_combos,
+            market_regime_adj=regime_adj, weekly_trend_adj=wt_adj,
+            trend_context_adj=tc_adj, calendar_adj=calendar_adj)
+
+        if not passed:
+            return None
+
+        has_combo = d.get("黄金组合匹配", False)
+        # 推荐等级
+        if has_combo and tech_score >= TECH_GATE_THRESHOLD + 15:
+            rec_level = "强推荐"
+        elif has_combo or tech_score >= TECH_GATE_THRESHOLD + 10:
+            rec_level = "推荐"
+        else:
+            rec_level = "弱推荐"
+
+        latest = kl.iloc[-1]
+        price = float(row.get("最新价", latest["收盘"]))
+        mktcap_yi = row.get("总市值", 0)
+        if isinstance(mktcap_yi, (int, float)) and mktcap_yi > 0:
+            mktcap_yi = mktcap_yi / 1e8
+        else:
+            mktcap_yi = fi.get("总市值", 0) or 0
+        _, lc_adj = apply_largecap_adjustments(mktcap_yi)
+
+        risk = calc_position_and_risk_t5(
+            tech_score, pos_mult, sentiment_score, nb_total,
+            limit_up, limit_down, price, kl, largecap_adj=lc_adj)
+
+        return {
+            "代码": code, "名称": name, "最新价": price,
+            "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
+            "换手率": row.get("换手率", 0),
+            "技术分": tech_score, "仓位倍率": pos_mult,
+            "基本面分": fs, "聪明钱分": es,
+            "推荐等级": rec_level,
+            "信号": d, "理由": r,
+            "行业": stock_ind, "市值亿": mktcap_yi,
+            "risk": risk, "kline": kl,
+            "黄金组合": has_combo,
+        }
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyze_one_t5, c): c for c in analyze_list}
+        for f in as_completed(futures):
+            done += 1
+            if done % 200 == 0:
+                print(f"  进度: {done}/{len(analyze_list)} | 候选: {len(results)}")
+            try:
+                r = f.result()
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    print(f"  完成！{len(results)} 只通过技术门槛")
+
+    if not results:
+        print()
+        print("  今日无股票通过技术面独立门槛，暂无波段推荐。")
+        return
+
+    # ── 排序选股 ──
+    results.sort(key=lambda x: x["技术分"], reverse=True)
+
+    # 优先黄金组合，再分散行业
+    combo_results = [r for r in results if r["黄金组合"]]
+    other_results = [r for r in results if not r["黄金组合"]]
+
+    selected = []
+    used_ind = set()
+    for pool in [combo_results, other_results]:
+        for r in pool:
+            if len(selected) >= 3:
+                break
+            r_ind = r.get("行业", "")
+            if r_ind and r_ind in used_ind:
+                continue
+            selected.append(r)
+            if r_ind:
+                used_ind.add(r_ind)
+    # 补齐3只
+    for r in results:
+        if len(selected) >= 3:
+            break
+        if r not in selected:
+            selected.append(r)
+
+    # ── 输出 ──
+    print()
+    print("=" * 65)
+    has_strong = any(s["推荐等级"] == "强推荐" for s in selected)
+    if has_strong:
+        print("  ★★★ T+5 波段操作建议 ★★★")
+    else:
+        print("  ★★ T+5 波段参考（无黄金组合强推荐）★★")
+    print("=" * 65)
+
+    for i, stock in enumerate(selected):
+        rk = stock["risk"]
+        rec = stock["推荐等级"]
+        print()
+        print(f"  ━━━ 第{i+1}只: {stock['名称']}({stock['代码']}) [{rec}] ━━━")
+        print()
+        print(f"  现价: {stock['最新价']:.2f}   今日涨幅: {stock['涨跌幅']:+.2f}%")
+        if stock.get("行业"):
+            print(f"  行业: {stock['行业']}")
+        d = stock["信号"]
+        print(f"  技术评分: {stock['技术分']:.0f}分 {d.get('技术门槛', '')}")
+        print(f"  仓位调节: {d.get('仓位倍率', '')} (基本面{stock['基本面分']}/50 聪明钱{stock['聪明钱分']}/80)")
+        if stock["黄金组合"]:
+            print(f"  黄金组合: {d.get('组合', '')} ★")
+        print(f"  买入理由: {stock['理由']}")
+
+        print()
+        print(f"  ── T+5 波段风控 ({rk['风险等级']} | ATR {rk['ATR']:.1f}%) ──")
+        print(f"  建议仓位: {rk['仓位']}%")
+        print(f"  止损价:   {rk['止损价']:.2f} ({rk['止损幅度']:.1f}%)")
+        print(f"  目标一:   {rk['止盈一']:.2f} (+{rk['止盈一幅度']:.1f}%) → 卖1/3")
+        print(f"  目标二:   {rk['止盈二']:.2f} (+{rk['止盈二幅度']:.1f}%) → 再卖1/3")
+        print(f"  目标三:   {rk['止盈三']:.2f} (+{rk['止盈三幅度']:.1f}%) → 清仓")
+        print(f"  移动止损: {rk['移动止损']}")
+        print(f"  时间止损: {rk['时间止损']}")
+
+        print()
+        print(f"  ── 持仓5天操作计划 ──")
+        print(f"  Day 1: 尾盘买入，设好止损价 {rk['止损价']:.2f}")
+        print(f"  Day 2: 观察趋势确认，不急于操作")
+        print(f"  Day 3: 若达目标一 {rk['止盈一']:.2f}，卖出1/3，止损移至成本价")
+        print(f"  Day 4: 若达目标二 {rk['止盈二']:.2f}，再卖1/3，止损移至目标一")
+        print(f"  Day 5: 收盘前无条件清仓所有剩余仓位！")
+
+    # 市场综合
+    print()
+    print("=" * 65)
+    print(f"  ── T+5 综合研判 ──")
+    print()
+    print(f"  大盘趋势:   {regime_label or '中性'}")
+    print(f"  大盘情绪:   {sentiment_info}")
+    print(f"  新闻面:     {news_mood}")
+    if hot_concepts:
+        top_c = [f"{c}({s}分)" for c, s in hot_concepts[:5]]
+        print(f"  今日热点:   {', '.join(top_c)}")
+    print(f"  通过门槛:   {len(results)} 只 (黄金组合 {len(combo_results)} 只)")
+    print()
+    print("  风险提示:")
+    print("  - T+5波段持有2-5天，比T+1承受更大波动")
+    print("  - 技术面独立达标才推荐，基本面仅调仓位大小")
+    print("  - 严格执行止损和第5天清仓纪律")
+    print("=" * 65)
+    print()
+
+    # 记录推荐
+    try:
+        from trade_tracker import record_recommendation
+        for s in selected:
+            record_recommendation("T+5", s["代码"], s["名称"], s["最新价"],
+                                   s["技术分"], s["推荐等级"], s["risk"])
+    except Exception:
+        pass
+
+
+def backtest_t5(code=None, days=250):
+    """T+5 波段回测：持有5天卖出"""
+    print("=" * 55)
+    print("  T+5 波段策略回测")
+    print("=" * 55)
+    print()
+
+    cal_weights, cal_threshold, cal_combos = load_calibrated_weights()
+    print(f"  技术门槛: {TECH_GATE_THRESHOLD}")
+
+    if code:
+        codes = [str(code)]
+        print(f"  回测标的: {code}")
+    else:
+        print("  选取活跃股进行回测...")
+        stock_list = fetch_stock_list_sina()
+        if stock_list.empty:
+            print("[错误] 无法获取股票列表")
+            return
+        active = stock_list[(stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 100)]
+        if active.empty:
+            active = stock_list.head(50)
+        codes = active.sample(min(50, len(active)), random_state=42)["代码"].tolist()
+        print(f"  选取 {len(codes)} 只活跃股")
+
+    print(f"  回测天数: ~{days} 个交易日")
+    print(f"  策略: 技术门槛>={TECH_GATE_THRESHOLD} + 高胜率信号 → 买入，持有5天卖出")
+    print()
+
+    all_trades = []
+    cap_sim = {"主力净流入占比": 3, "主力净流入": 1e7,
+               "超大单净流入": 0, "超大单占比": 0, "大单净流入": 0, "大单占比": 0}
+
+    for i, c in enumerate(codes):
+        if (i + 1) % 10 == 0:
+            print(f"  回测进度: {i+1}/{len(codes)}")
+
+        kline = fetch_kline_long(c, days=days)
+        if kline.empty or len(kline) < 60:
+            continue
+        kline = calc_all_indicators(kline)
+
+        for j in range(30, len(kline) - 5):
+            window = kline.iloc[:j+1].copy()
+            tech_sc, pos_mult, details, _, passed = evaluate_signals_gated(
+                window, cap_sim, 8, 8, 25, {}, 0, {},
+                calibrated_weights=cal_weights, golden_combos=cal_combos)
+
+            if not passed:
+                continue
+
+            buy_price = kline.iloc[j]["收盘"]
+            # 模拟5天持有，检查止损
+            atr = kline.iloc[max(0,j-20):j+1]["振幅"].mean()
+            stop_pct = -3.0 if atr > 6 else (-4.0 if atr > 4 else -5.0)
+            stop_price = buy_price * (1 + stop_pct / 100)
+
+            exit_price = None
+            exit_day = 5
+            for d in range(1, 6):
+                if j + d >= len(kline):
+                    break
+                day_low = kline.iloc[j + d]["最低"]
+                day_close = kline.iloc[j + d]["收盘"]
+                if day_low <= stop_price:
+                    exit_price = stop_price
+                    exit_day = d
+                    break
+            if exit_price is None:
+                idx = min(j + 5, len(kline) - 1)
+                exit_price = kline.iloc[idx]["收盘"]
+
+            pnl = (exit_price - buy_price) / buy_price * 100
+            all_trades.append({
+                "代码": c, "买入日": kline.iloc[j]["日期"],
+                "买入价": buy_price, "卖出价": exit_price,
+                "收益率": pnl, "持有天数": exit_day,
+                "黄金组合": details.get("黄金组合匹配", False),
+            })
+
+        time.sleep(0.15)
+
+    if not all_trades:
+        print("  回测期间无交易信号")
+        return
+
+    df_trades = pd.DataFrame(all_trades)
+    total = len(df_trades)
+    wins = len(df_trades[df_trades["收益率"] > 0])
+    wr = wins / total * 100
+    avg_ret = df_trades["收益率"].mean()
+    avg_win = df_trades[df_trades["收益率"] > 0]["收益率"].mean() if wins > 0 else 0
+    avg_loss = df_trades[df_trades["收益率"] <= 0]["收益率"].mean() if (total - wins) > 0 else 0
+    avg_days = df_trades["持有天数"].mean()
+
+    print("  ── T+5 回测结果 ──")
+    print()
+    print(f"  总交易次数:  {total}")
+    print(f"  胜率:        {wr:.1f}%")
+    print(f"  平均收益:    {avg_ret:+.2f}%")
+    print(f"  平均盈利:    {avg_win:+.2f}%")
+    print(f"  平均亏损:    {avg_loss:+.2f}%")
+    if avg_loss != 0:
+        print(f"  盈亏比:      {abs(avg_win/avg_loss):.2f}")
+    print(f"  平均持有:    {avg_days:.1f}天")
+    print()
+
+    # 黄金组合子集
+    combo_trades = df_trades[df_trades["黄金组合"] == True]
+    if len(combo_trades) > 0:
+        cw = len(combo_trades[combo_trades["收益率"] > 0])
+        print(f"  ── 黄金组合子集 ──")
+        print(f"  交易次数:    {len(combo_trades)}")
+        print(f"  胜率:        {cw / len(combo_trades) * 100:.1f}%")
+        print(f"  平均收益:    {combo_trades['收益率'].mean():+.2f}%")
+    print()
+
+    # 分布
+    bins = [-999, -5, -3, -1, 0, 2, 5, 8, 999]
+    labels = ["<-5%", "-5~-3%", "-3~-1%", "-1~0%", "0~2%", "2~5%", "5~8%", ">8%"]
+    df_trades["区间"] = pd.cut(df_trades["收益率"], bins=bins, labels=labels)
+    dist = df_trades["区间"].value_counts().sort_index()
+    print("  ── 收益分布 ──")
+    table = []
+    max_count = dist.max() if len(dist) > 0 else 1
+    for interval, count in dist.items():
+        bar = "#" * int(count / max_count * 15)
+        table.append([interval, count, f"{count/total*100:.1f}%", bar])
+    print(tabulate(table, headers=["区间", "次数", "占比", "分布"], tablefmt="grid"))
+    print()
+
 
 # ============================================================
 # ETF 波段分析（持有1-5天）
@@ -5009,6 +5747,23 @@ if __name__ == "__main__":
     elif args[0] == "--backtest":
         code = args[1] if len(args) > 1 and args[1].isdigit() else None
         backtest(code)
+    elif args[0] == "--go5":
+        go5_decision()
+    elif args[0] == "--backtest5":
+        code = args[1] if len(args) > 1 and args[1].isdigit() else None
+        backtest_t5(code)
+    elif args[0] == "--track":
+        try:
+            from trade_tracker import show_trade_report
+            show_trade_report()
+        except Exception as e:
+            print(f"[错误] {e}")
+    elif args[0] == "--update-trades":
+        try:
+            from trade_tracker import update_outcomes
+            update_outcomes()
+        except Exception as e:
+            print(f"[错误] {e}")
     elif args[0] == "--calibrate":
         calibrate()
     elif args[0] == "--market":

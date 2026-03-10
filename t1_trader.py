@@ -2235,6 +2235,178 @@ def apply_weights(signals, weights=None):
     return score, fired_signals
 
 
+# ============================================================
+# 多维度增强分析：大盘趋势/周线/历史形态/日历效应
+# ============================================================
+
+def calc_market_regime():
+    """
+    大盘趋势研判：上证指数在MA20/MA60之上还是之下
+    返回 (regime: str, score_adj: int, label: str)
+    regime: 'bull' / 'neutral' / 'bear'
+    """
+    try:
+        kl = fetch_kline("000001", days=80)
+        if kl.empty or len(kl) < 60:
+            return "neutral", 0, ""
+        kl = calc_all_indicators(kl)
+        latest = kl.iloc[-1]
+        close = latest["收盘"]
+        ma20 = latest.get("MA20", close)
+        ma5 = latest.get("MA5", close)
+        ma10 = latest.get("MA10", close)
+        # 计算60日均线
+        if len(kl) >= 60:
+            ma60 = kl["收盘"].iloc[-60:].mean()
+        else:
+            ma60 = close
+        above_ma20 = close > ma20
+        above_ma60 = close > ma60
+        short_bull = ma5 > ma10
+
+        # 计算大盘RSI
+        rsi = latest.get("RSI6", 50)
+
+        if above_ma20 and above_ma60 and short_bull:
+            return "bull", 10, "大盘多头(MA20+MA60上方)"
+        elif above_ma20 and short_bull:
+            return "bull", 5, "大盘偏多(MA20上方)"
+        elif not above_ma20 and not above_ma60 and not short_bull:
+            return "bear", -15, "大盘空头(MA20+MA60下方)"
+        elif not above_ma20 and not short_bull:
+            return "bear", -10, "大盘偏空(MA20下方)"
+        else:
+            return "neutral", 0, "大盘震荡"
+    except Exception:
+        return "neutral", 0, ""
+
+
+def calc_weekly_trend(df):
+    """
+    周线趋势确认：将日线重采样为周线，判断周级趋势
+    返回 (score_adj: int, label: str)
+    """
+    if len(df) < 30:
+        return 0, ""
+    try:
+        # 重采样为周线
+        wdf = df.copy()
+        wdf.index = pd.to_datetime(wdf["日期"])
+        weekly = wdf.resample("W").agg({
+            "开盘": "first", "最高": "max", "最低": "min",
+            "收盘": "last", "成交量": "sum"
+        }).dropna()
+        if len(weekly) < 5:
+            return 0, ""
+        weekly["MA5"] = weekly["收盘"].rolling(5).mean()
+        weekly["MA10"] = weekly["收盘"].rolling(10).mean()
+        latest_w = weekly.iloc[-1]
+        prev_w = weekly.iloc[-2]
+        ma5w = latest_w.get("MA5", np.nan)
+        ma10w = latest_w.get("MA10", np.nan)
+        if pd.isna(ma5w) or pd.isna(ma10w):
+            return 0, ""
+        # 周线多头：周MA5>MA10 且 本周收涨
+        weekly_bull = ma5w > ma10w and latest_w["收盘"] > prev_w["收盘"]
+        # 周线空头：周MA5<MA10 且 本周收跌
+        weekly_bear = ma5w < ma10w and latest_w["收盘"] < prev_w["收盘"]
+        if weekly_bull:
+            return 8, "周线多头"
+        elif weekly_bear:
+            return -10, "周线空头"
+        else:
+            return 0, ""
+    except Exception:
+        return 0, ""
+
+
+def classify_trend_context(df):
+    """
+    历史趋势形态识别：上升趋势回调(最佳) / 下降趋势反弹(最差) / 横盘
+    返回 (score_adj: int, label: str)
+    """
+    if len(df) < 60:
+        return 0, ""
+    close = df["收盘"].values
+    latest_close = close[-1]
+
+    # 20日和60日均线斜率
+    ma20_now = np.mean(close[-20:])
+    ma20_10ago = np.mean(close[-30:-10]) if len(close) >= 30 else ma20_now
+    ma20_rising = ma20_now > ma20_10ago
+
+    # 距60日高点的回撤
+    high_60 = np.max(close[-60:])
+    low_60 = np.min(close[-60:])
+    drawdown = (high_60 - latest_close) / high_60 if high_60 > 0 else 0
+    recovery = (latest_close - low_60) / low_60 if low_60 > 0 else 0
+
+    if ma20_rising and drawdown < 0.15:
+        # 上升趋势回调：MA20上行，距高点<15%
+        return 10, "上升回调(最佳形态)"
+    elif ma20_rising and drawdown < 0.25:
+        return 5, "上升趋势中"
+    elif not ma20_rising and drawdown > 0.25:
+        # 下降趋势反弹：MA20下行，距高点>25%
+        return -10, "下降反弹(警惕)"
+    elif not ma20_rising and drawdown > 0.15:
+        return -5, "弱势整理"
+    else:
+        return 0, "横盘整理"
+
+
+def calc_calendar_adjustment():
+    """
+    日历/季节效应调整（A股特有）
+    返回 (score_adj: int, label: str)
+    """
+    from datetime import datetime
+    now = datetime.now()
+    weekday = now.weekday()  # 0=周一
+    month = now.month
+    day = now.day
+
+    adj = 0
+    labels = []
+
+    # 周几效应（T+1意味着今天买明天卖）
+    if weekday == 4:  # 周五买入 → 周一卖（持过周末风险大）
+        adj -= 8
+        labels.append("周五(持周末风险)")
+    elif weekday == 0:  # 周一买入 → 周二卖
+        adj -= 3
+        labels.append("周一(开盘不稳)")
+    elif weekday in (1, 2):  # 周二/三最佳
+        adj += 3
+        labels.append("周中(最优T+1窗口)")
+
+    # 月份效应
+    if month == 1 or (month == 2 and day <= 15):
+        adj += 3; labels.append("年初效应(偏多)")
+    elif month in (3, 4):
+        adj += 2; labels.append("春季行情")
+    elif month in (7, 8):
+        adj -= 3; labels.append("暑期淡季")
+
+    # 两会效应（3月初）
+    if month == 3 and day <= 15:
+        adj += 3; labels.append("两会行情")
+
+    # 国庆/春节前（减仓期）
+    if (month == 9 and day >= 25) or (month == 1 and day >= 20):
+        adj -= 5; labels.append("长假前(资金撤离)")
+
+    # 年末效应（机构调仓）
+    if month == 12 and day >= 20:
+        adj -= 3; labels.append("年末调仓")
+
+    # 季报窗口（业绩预告期偏多）
+    if (month == 1 and 10 <= day <= 31) or (month == 4 and 1 <= day <= 20):
+        adj += 2; labels.append("业绩窗口")
+
+    return adj, "；".join(labels) if labels else ""
+
+
 # ── 高胜率信号白名单（回测胜率>53%的信号）──
 HIGH_WINRATE_SIGNALS = {
     "BOLL_触及下轨",     # 59.9%
@@ -2290,7 +2462,9 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
                         chip_data=None, tail_flow=None, leader_score=0, leader_label="",
                         research_data=None, calibrated_weights=None, golden_combos=None,
                         commodity_penalty=0, rally_penalty=0,
-                        global_risk=0, ah_penalty=0, turnover_adj=0, macro_adj=0):
+                        global_risk=0, ah_penalty=0, turnover_adj=0, macro_adj=0,
+                        market_regime_adj=0, weekly_trend_adj=0,
+                        trend_context_adj=0, calendar_adj=0):
     """
     综合评分，十五大维度：
     技术面(信号驱动) + 资金面 + 量价 + 板块 + 情绪 + 形态
@@ -2311,7 +2485,7 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     # === 信号质量评估 ===
     sig_quality, high_count, low_count = calc_signal_quality(fired)
 
-    # 低胜率信号惩罚：减少垃圾信号堆分
+    # 低胜率信号惩罚
     if low_count >= 3 and high_count == 0:
         score -= 10  # 全是低胜率信号，扣分
 
@@ -2483,7 +2657,10 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
 
     if combo_bonus > 0:
         details["组合"] = matched_combo
+        details["黄金组合匹配"] = True
         reasons.append(matched_combo)
+    else:
+        details["黄金组合匹配"] = False
 
     # === 信号质量标签 ===
     if sig_quality == 'A':
@@ -2531,6 +2708,34 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
             details["宏观趋势"] = f"契合+{macro_adj}"
         else:
             details["宏观趋势"] = f"逆势{macro_adj}"
+
+    # === 大盘趋势研判（熊市小扣，牛市不加）===
+    if market_regime_adj < 0:
+        score += max(market_regime_adj, -8)
+        details["大盘趋势"] = f"偏空({max(market_regime_adj, -8)})"
+    elif market_regime_adj > 0:
+        details["大盘趋势"] = "偏多"
+
+    # === 周线趋势确认（空头扣分，多头不加）===
+    if weekly_trend_adj < 0:
+        score += max(weekly_trend_adj, -5)
+        details["周线"] = f"空头({max(weekly_trend_adj, -5)})"
+    elif weekly_trend_adj > 0:
+        details["周线"] = "多头"
+
+    # === 历史趋势形态（下降反弹小扣）===
+    if trend_context_adj < 0:
+        score += max(trend_context_adj, -5)
+        details["趋势形态"] = f"不利({max(trend_context_adj, -5)})"
+    elif trend_context_adj > 0:
+        details["趋势形态"] = "上升回调"
+
+    # === 日历效应（周五扣分，其他不动）===
+    if calendar_adj < -5:
+        score += -5  # 最多扣5分（周五）
+        details["日历"] = "周五(-5)"
+    elif calendar_adj > 0:
+        details["日历"] = "有利"
 
     reason_str = "；".join(reasons) if reasons else "信号不足"
     return score, details, reason_str
@@ -2992,9 +3197,9 @@ def backtest(code=None, days=250):
                    "超大单净流入": 0, "超大单占比": 0, "大单净流入": 0, "大单占比": 0}
         for j in range(30, len(kline) - 1):
             window = kline.iloc[:j+1].copy()
-            sc, _, _ = evaluate_signals_v2(window, cap_sim, 8, 8, 25, {},
-                                           calibrated_weights=cal_weights,
-                                           golden_combos=cal_combos)
+            sc, details, _ = evaluate_signals_v2(
+                window, cap_sim, 8, 8, 25, {},
+                calibrated_weights=cal_weights, golden_combos=cal_combos)
             if sc >= bt_threshold:
                 buy_price = kline.iloc[j]["收盘"]
                 sell_price = kline.iloc[j+1]["收盘"]
@@ -3003,6 +3208,7 @@ def backtest(code=None, days=250):
                     "代码": c, "买入日": kline.iloc[j]["日期"],
                     "买入价": buy_price, "卖出价": sell_price,
                     "收益率": pnl,
+                    "黄金组合": details.get("黄金组合匹配", False),
                 })
 
         time.sleep(0.15)
@@ -3039,6 +3245,19 @@ def backtest(code=None, days=250):
     print(f"  ── 加入止损(-2%)后 ──")
     print(f"  平均收益:    {stop_avg:+.2f}%")
     print()
+
+    # 黄金组合子集胜率
+    if "黄金组合" in df_trades.columns:
+        combo_trades = df_trades[df_trades["黄金组合"] == True]
+        if len(combo_trades) > 0:
+            combo_win = len(combo_trades[combo_trades["收益率"] > 0])
+            combo_wr = combo_win / len(combo_trades) * 100
+            combo_avg = combo_trades["收益率"].mean()
+            print(f"  ── 黄金组合子集 ──")
+            print(f"  交易次数:    {len(combo_trades)}")
+            print(f"  胜率:        {combo_wr:.1f}%")
+            print(f"  平均收益:    {combo_avg:+.2f}%")
+            print()
 
     bins = [-999, -5, -3, -2, -1, 0, 1, 2, 3, 5, 999]
     labels = ["<-5%", "-5~-3%", "-3~-2%", "-2~-1%", "-1~0%",
@@ -3648,6 +3867,16 @@ def go_decision():
     else:
         print(f"  市场环境正常")
 
+    # ── Step 0.x: 多维度增强分析 ──
+    print()
+    print("[0.3/16] 大盘趋势+日历效应+增强分析...")
+    market_regime, regime_adj, regime_label = calc_market_regime()
+    calendar_adj, calendar_label = calc_calendar_adjustment()
+    if regime_label:
+        print(f"  大盘趋势: {regime_label} ({regime_adj:+d}分)")
+    if calendar_label:
+        print(f"  日历效应: {calendar_label} ({calendar_adj:+d}分)")
+
     # ── Step 0.5: 国际大宗商品 + 全球市场 + AH溢价 ──
     print()
     print("[0.5/16] 获取国际大宗商品行情...")
@@ -3872,6 +4101,10 @@ def go_decision():
         # ★ 宏观趋势匹配
         macro_adj, macro_label = check_macro_trend_fit(stock_ind, name, trend_industries)
 
+        # ★ 周线趋势 + 历史形态
+        wt_adj, wt_label = calc_weekly_trend(kline)
+        tc_adj, tc_label = classify_trend_context(kline)
+
         extra_s, extra_d, extra_r = evaluate_extra_dimensions(
             code, billboard_data, margin_data, northbound_total, limit_up, limit_down,
             limit_up_pool, billboard_detail, shareholder_data, industry_data, stock_ind)
@@ -3881,7 +4114,9 @@ def go_decision():
                                        calibrated_weights=cal_weights, golden_combos=cal_combos,
                                        commodity_penalty=commodity_pen, rally_penalty=rally_pen,
                                        global_risk=global_penalty, ah_penalty=ah_pen,
-                                       turnover_adj=turnover_adj, macro_adj=macro_adj)
+                                       turnover_adj=turnover_adj, macro_adj=macro_adj,
+                                       market_regime_adj=regime_adj, weekly_trend_adj=wt_adj,
+                                       trend_context_adj=tc_adj, calendar_adj=calendar_adj)
 
         # 新闻热点加分：如果股票名称匹配热门概念
         news_bonus = 0
@@ -3914,13 +4149,16 @@ def go_decision():
         lc_bonus, lc_adj = apply_largecap_adjustments(mktcap_yi)
 
         sig_q = d.get("信号质量", "C级")
+        has_combo = d.get("黄金组合匹配", False)
 
-        # 判断推荐等级
+        # 判断推荐等级（黄金组合是强推荐的硬门槛）
         go_threshold = (cal_threshold if cal_weights else 100) + lc_bonus
-        if total_score >= go_threshold and "C级" not in sig_q:
+        if total_score >= go_threshold and has_combo:
             rec_level = "强推荐"
+        elif total_score >= go_threshold and "C级" not in sig_q:
+            rec_level = "推荐"
         elif total_score >= go_threshold:
-            rec_level = "推荐(信号偏弱)"
+            rec_level = "弱推荐"
         elif total_score >= go_threshold * 0.7:
             rec_level = "弱推荐"
         else:

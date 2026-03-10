@@ -403,6 +403,10 @@ def api_go():
 
             market_blocked = severity >= 3
 
+            # 多维度增强分析
+            market_regime, regime_adj, regime_label = t1.calc_market_regime()
+            calendar_adj, calendar_label = t1.calc_calendar_adjustment()
+
             yield sse({"type": "progress", "msg": "获取大宗商品+全球市场+AH溢价...", "pct": 4})
             commodity_data = t1.fetch_commodity_prices()
             global_markets = t1.fetch_global_markets()
@@ -494,6 +498,8 @@ def api_go():
                 current_turnover = row.get("换手率", 0) or 0
                 turnover_adj_val, turnover_label = t1.analyze_turnover_depth(kl, current_turnover)
                 macro_adj_val, macro_label = t1.check_macro_trend_fit(stock_ind, name, trend_industries)
+                wt_adj, _ = t1.calc_weekly_trend(kl)
+                tc_adj, _ = t1.classify_trend_context(kl)
                 es, ed, er = t1.evaluate_extra_dimensions(
                     code, billboard_data, margin_data, nb_total, limit_up, limit_down,
                     limit_up_pool, billboard_detail, shareholder_data, industry_data, stock_ind)
@@ -502,7 +508,9 @@ def api_go():
                     calibrated_weights=cal_weights, golden_combos=cal_combos,
                     commodity_penalty=commodity_pen, rally_penalty=rally_pen,
                     global_risk=global_penalty, ah_penalty=ah_pen,
-                    turnover_adj=turnover_adj_val, macro_adj=macro_adj_val)
+                    turnover_adj=turnover_adj_val, macro_adj=macro_adj_val,
+                    market_regime_adj=regime_adj, weekly_trend_adj=wt_adj,
+                    trend_context_adj=tc_adj, calendar_adj=calendar_adj)
                 news_bonus = 0
                 matched_concept = ""
                 for concept, bonus in concept_bonus.items():
@@ -528,11 +536,14 @@ def api_go():
                 lc_bonus, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
                 go_th = (cal_threshold if cal_weights else 100) + lc_bonus
                 sig_q = d.get("信号质量", "C级")
-                # 判断推荐等级
-                if total_score >= go_th and "C级" not in sig_q:
+                has_combo = d.get("黄金组合匹配", False)
+                # 判断推荐等级（黄金组合是强推荐硬门槛）
+                if total_score >= go_th and has_combo:
                     rec_level = "强推荐"
+                elif total_score >= go_th and "C级" not in sig_q:
+                    rec_level = "推荐"
                 elif total_score >= go_th:
-                    rec_level = "推荐(信号偏弱)"
+                    rec_level = "弱推荐"
                 elif total_score >= go_th * 0.7:
                     rec_level = "弱推荐"
                 else:

@@ -3365,7 +3365,7 @@ def analyze_single_v2(code):
     print()
     print("=" * 55)
     print(f"  {name}({code}) 深度分析报告")
-    print(f"  日期: {latest['日期']}    综合评分: {score}/280")
+    print(f"  日期: {latest['日期']}    综合评分: {score:.1f}/280")
     print("=" * 55)
 
     print()
@@ -3443,7 +3443,7 @@ def analyze_single_v2(code):
         print(f"  {key}: {val}")
 
     print()
-    print(f"  ★ 综合评分: {score}/280")
+    print(f"  ★ 综合评分: {score:.1f}/280")
     print(f"  买入理由: {reasons}")
     if score >= 170:
         print("  结论: 强烈关注！技术面+基本面+资金面+聪明钱共振")
@@ -4484,10 +4484,10 @@ def go_decision():
             "最新价": price,
             "涨跌幅": row.get("涨跌幅", latest["涨跌幅"]),
             "换手率": row.get("换手率", 0),
-            "评分": total_score,
+            "评分": round(total_score, 1),
             "信号质量": sig_q,
             "推荐等级": rec_level,
-            "技术分": s - fund_s - extra_s,
+            "技术分": round(s - fund_s - extra_s, 1),
             "基本面分": fund_s,
             "聪明钱分": extra_s,
             "新闻加分": news_bonus,
@@ -4576,8 +4576,8 @@ def go_decision():
             print(f"  市值: {stock['市值亿']:.0f}亿 (大盘股风控已启用)")
         if stock.get("行业"):
             print(f"  行业: {stock['行业']}")
-        print(f"  评分: {stock['评分']}/280")
-        score_parts = [f"技术面{stock['技术分']}分", f"基本面{stock['基本面分']}/50分",
+        print(f"  评分: {stock['评分']:.1f}/280")
+        score_parts = [f"技术面{stock['技术分']:.1f}分", f"基本面{stock['基本面分']}/50分",
                        f"聪明钱{stock['聪明钱分']}/80分"]
         if stock["新闻加分"] > 0:
             score_parts.append(f"新闻+{stock['新闻加分']}分[{stock['匹配概念']}]")

@@ -3619,7 +3619,7 @@ def load_calibrated_weights():
         return None, 120, []
 
 
-def calibrate(days=250, sample_size=80):
+def calibrate(days=250, sample_size=200):
     """
     校准回测：遍历历史数据，统计每个信号的真实次日胜率和平均收益。
     用胜率×平均收益×样本量 计算数据驱动的权重。
@@ -3733,7 +3733,7 @@ def calibrate(days=250, sample_size=80):
 
     # 重新遍历，收集每个交易点的信号组合 + 收益
     combo_data = []  # [(fired_set, return)]
-    for code in codes[:50]:  # 用子集
+    for code in codes[:100]:  # 用更大子集提高组合分析可靠性
         kline = fetch_kline_long(code, days=days)
         if kline.empty or len(kline) < 60:
             continue
@@ -3825,7 +3825,7 @@ def calibrate(days=250, sample_size=80):
 
     # 重新跑一遍，用校准权重，测试不同阈值
     all_scores_returns = []
-    for code in codes[:30]:  # 用子集加速
+    for code in codes[:80]:  # 用更大子集提高阈值优化可靠性
         kline = fetch_kline_long(code, days=days)
         if kline.empty or len(kline) < 60:
             continue

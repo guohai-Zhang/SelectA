@@ -206,26 +206,35 @@ def fetch_realtime_sina(codes):
 
 
 def fetch_stock_list_sina():
-    """通过新浪接口获取A股列表（含实时行情）"""
-    # 使用东方财富delay接口获取列表（它返回完整的股票列表）
+    """通过东方财富接口获取A股列表（含实时行情），分页获取全量数据"""
     url = "http://push2delay.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1, "pz": 6000, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-        "fid": "f3", "fs": FS_ALL_A, "ut": UT,
-        "fields": "f12,f14,f2,f3,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21"
+    fields = "f12,f14,f2,f3,f5,f6,f7,f8,f9,f10,f15,f16,f17,f18,f20,f21"
+    col_map = {
+        "f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅",
+        "f5": "成交量", "f6": "成交额", "f7": "振幅", "f8": "换手率",
+        "f9": "市盈率", "f10": "量比", "f15": "最高", "f16": "最低",
+        "f17": "今开", "f18": "昨收", "f20": "总市值", "f21": "流通市值"
     }
+    all_items = []
+    page_size = 100
     try:
-        resp = _get(url, params=params, headers={"Referer": "http://data.eastmoney.com/"})
-        data = resp.json()
-        if not (data.get("data") and data["data"].get("diff")):
+        for pn in range(1, 80):  # 最多80页 = 8000只
+            params = {
+                "pn": pn, "pz": page_size, "po": 0, "np": 1, "fltt": 2, "invt": 2,
+                "fid": "f12", "fs": FS_ALL_A, "ut": UT,
+                "fields": fields,
+            }
+            resp = _get(url, params=params, headers={"Referer": "http://data.eastmoney.com/"})
+            data = resp.json()
+            diff = data.get("data", {}).get("diff", [])
+            if not diff:
+                break
+            all_items.extend(diff)
+            if len(diff) < page_size:
+                break
+        if not all_items:
             return pd.DataFrame()
-        df = pd.DataFrame(data["data"]["diff"])
-        col_map = {
-            "f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅",
-            "f5": "成交量", "f6": "成交额", "f7": "振幅", "f8": "换手率",
-            "f9": "市盈率", "f10": "量比", "f15": "最高", "f16": "最低",
-            "f17": "今开", "f18": "昨收", "f20": "总市值", "f21": "流通市值"
-        }
+        df = pd.DataFrame(all_items)
         df = df.rename(columns=col_map)
         df["代码"] = df["代码"].astype(str)
         df["名称"] = df["名称"].astype(str)

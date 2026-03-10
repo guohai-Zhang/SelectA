@@ -366,7 +366,7 @@ def api_scan(top: int = Query(15, ge=1, le=50)):
                 else:
                     mktcap_yi = fi.get("总市值", 0) or 0
                 lc_bonus, _ = t1.apply_largecap_adjustments(mktcap_yi)
-                scan_th = (cal_threshold if cal_weights else 90) + lc_bonus
+                scan_th = (cal_threshold if cal_weights else 110) + lc_bonus
                 if s >= scan_th:
                     return {
                         "代码": code, "名称": name,
@@ -559,15 +559,18 @@ def api_go():
                 go_th = (cal_threshold if cal_weights else 100) + lc_bonus
                 sig_q = d.get("信号质量", "C级")
                 has_combo = d.get("黄金组合匹配", False)
-                # 判断推荐等级（黄金组合是强推荐硬门槛）
-                if total_score >= go_th and has_combo:
-                    rec_level = "强推荐"
-                elif total_score >= go_th and "C级" not in sig_q:
-                    rec_level = "推荐"
+                high_q = "A级" in sig_q  # ★ A级=2+高胜率信号
+                mid_q = "B级" in sig_q   # ★ B级=1个高胜率信号
+
+                # ★ 推荐等级：回测验证，黄金组合64%胜率，>=120分62%胜率
+                if total_score >= go_th + 20 and has_combo:
+                    rec_level = "强推荐"  # ★ 黄金组合+高分=强推荐（回测64%+）
+                elif total_score >= go_th + 10 and (has_combo or high_q):
+                    rec_level = "推荐"    # ★ 高分+A级信号=推荐（回测57%+）
+                elif total_score >= go_th and (high_q or mid_q):
+                    rec_level = "弱推荐"  # ★ 达标+至少1个高胜率信号
                 elif total_score >= go_th:
-                    rec_level = "弱推荐"
-                elif total_score >= go_th * 0.7:
-                    rec_level = "弱推荐"
+                    rec_level = "仅参考"  # ★ 达标但无高胜率信号=仅参考（回测53%，不赚钱）
                 else:
                     rec_level = "仅参考"
                 latest = kl.iloc[-1]

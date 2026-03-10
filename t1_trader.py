@@ -231,7 +231,7 @@ def fetch_stock_list_sina():
         df["名称"] = df["名称"].astype(str)
         df = df[df["最新价"] != "-"]
         df = df[~df["名称"].str.contains("ST|退市|N |C ", na=False)]
-        num_cols = ["最新价","涨跌幅","成交量","成交额","振幅","换手率","量比","最高","最低","今开","昨收"]
+        num_cols = ["最新价","涨跌幅","成交量","成交额","振幅","换手率","量比","最高","最低","今开","昨收","总市值","流通市值"]
         for col in num_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -1017,7 +1017,7 @@ def evaluate_extra_dimensions(code, billboard_data, margin_data, northbound_tota
 # 智能仓位管理 & 风控系统
 # ============================================================
 
-def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit_up, limit_down, price, kline):
+def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit_up, limit_down, price, kline, largecap_adj=None):
     """
     根据综合评分 + 市场环境，计算：
     1. 建议仓位比例
@@ -1079,6 +1079,16 @@ def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit
 
     position = max(10, min(base_position, 50))  # 限制在10%-50%
 
+    # 大盘股风控调整
+    largecap_label = ""
+    if largecap_adj:
+        position = min(position, largecap_adj.get("仓位上限", position))
+        extra_stop = largecap_adj.get("止损收紧", 0)
+        if extra_stop:
+            stop_pct += extra_stop  # extra_stop is negative, makes stop tighter
+            stop_loss = price * (1 + stop_pct / 100)
+        largecap_label = largecap_adj.get("标签", "")
+
     # 风险等级
     risk_factors = 0
     if atr > 5:
@@ -1098,6 +1108,9 @@ def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit
         risk_level = "低风险"
     else:
         risk_level = "极低风险"
+
+    if largecap_label:
+        risk_level = f"{risk_level}({largecap_label})"
 
     return {
         "仓位": position,
@@ -1371,6 +1384,603 @@ def calc_sector_leader_score(code, stock_chg, stock_mktcap, industry_data, stock
 
 
 # ============================================================
+# 大宗商品关联风险
+# ============================================================
+
+# 行业 → 关联大宗商品
+INDUSTRY_COMMODITY_MAP = {
+    "石油石化": ["原油"], "石油": ["原油"], "石油开采": ["原油"],
+    "化工": ["原油"], "基础化工": ["原油"],
+    "有色金属": ["铜", "黄金"], "贵金属": ["黄金"], "铜": ["铜"],
+    "农业": ["大豆"], "农林牧渔": ["大豆"], "养殖": ["大豆"],
+    "煤炭": ["原油"], "钢铁": ["铜"],
+}
+
+# 大宗商品名 → 关联的行业关键词（用于模糊匹配股票名称）
+COMMODITY_NAME_KEYWORDS = {
+    "原油": ["石油", "油气", "油服", "中海油", "中石油", "中石化", "海油"],
+    "黄金": ["黄金", "金矿", "贵金属"],
+    "铜": ["铜", "有色"],
+    "大豆": ["大豆", "粮油", "农业"],
+}
+
+
+def fetch_commodity_prices():
+    """获取国际大宗商品期货价格变动（东方财富外盘期货接口）"""
+    # 外盘期货代码: 原油CL, 黄金GC, 铜HG, 大豆S
+    secids = {
+        "原油": "113.CL00Y",
+        "黄金": "113.GC00Y",
+        "铜": "113.HG00Y",
+        "大豆": "113.S00Y",
+    }
+    result = {}
+    try:
+        ids_str = ",".join(secids.values())
+        resp = _get("http://push2delay.eastmoney.com/api/qt/ulist.np/get",
+                     params={"fltt": 2, "invt": 2, "ut": UT,
+                             "secids": ids_str,
+                             "fields": "f12,f14,f2,f3"},
+                     headers={"Referer": "http://quote.eastmoney.com/"},
+                     timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("diff", []) if data.get("data") else []
+        # 按secid顺序映射
+        secid_to_name = {v: k for k, v in secids.items()}
+        for item in items:
+            code = f"{item.get('f12', '')}"
+            name = item.get("f14", "")
+            price = item.get("f2", 0)
+            chg = item.get("f3", 0)
+            # 匹配商品名
+            for cn, sid in secids.items():
+                if cn in name or code in sid:
+                    result[cn] = {"价格": price, "涨跌幅": chg}
+                    break
+    except Exception:
+        pass
+
+    # 备用方案：如果上面没获取到，尝试逐个请求
+    if not result:
+        for cn, sid in secids.items():
+            try:
+                resp = _get("http://push2delay.eastmoney.com/api/qt/stock/get",
+                            params={"secid": sid, "ut": UT,
+                                    "fields": "f43,f170,f14"},
+                            headers={"Referer": "http://quote.eastmoney.com/"},
+                            timeout=8)
+                d = resp.json().get("data", {})
+                if d:
+                    price = d.get("f43", 0)
+                    chg = d.get("f170", 0)
+                    if isinstance(price, (int, float)) and price > 0:
+                        price = price / 100 if price > 10000 else price
+                    if isinstance(chg, (int, float)):
+                        chg = chg / 100 if abs(chg) > 100 else chg
+                    result[cn] = {"价格": price, "涨跌幅": chg}
+            except Exception:
+                pass
+
+    return result
+
+
+def check_commodity_risk(stock_industry, stock_name, commodity_data):
+    """
+    检查个股是否受大宗商品暴跌影响
+    返回 (penalty: int, warning: str)
+    """
+    if not commodity_data or not (stock_industry or stock_name):
+        return 0, ""
+
+    # 通过行业匹配
+    linked = set()
+    if stock_industry:
+        for ind_key, commodities in INDUSTRY_COMMODITY_MAP.items():
+            if ind_key in stock_industry or stock_industry in ind_key:
+                linked.update(commodities)
+
+    # 通过股票名称匹配
+    if stock_name:
+        for commodity, keywords in COMMODITY_NAME_KEYWORDS.items():
+            for kw in keywords:
+                if kw in stock_name:
+                    linked.add(commodity)
+
+    if not linked:
+        return 0, ""
+
+    worst_penalty = 0
+    warnings = []
+    for commodity in linked:
+        info = commodity_data.get(commodity)
+        if not info:
+            continue
+        chg = info.get("涨跌幅", 0)
+        if chg >= -2:
+            continue
+        if chg <= -7:
+            penalty = -35
+        elif chg <= -5:
+            penalty = -25
+        elif chg <= -3:
+            penalty = -15
+        else:
+            penalty = -8
+        if penalty < worst_penalty:
+            worst_penalty = penalty
+        warnings.append(f"{commodity}{chg:+.1f}%")
+
+    if warnings:
+        return worst_penalty, f"大宗商品风险({','.join(warnings)})"
+    return 0, ""
+
+
+def check_consecutive_rally(kline):
+    """
+    检测连续上涨/累计涨幅过大的追高风险
+    返回 (penalty: int, warning: str)
+    """
+    if kline.empty or len(kline) < 10:
+        return 0, ""
+
+    # 连涨天数
+    consecutive_up = 0
+    for i in range(len(kline) - 1, 0, -1):
+        if kline.iloc[i]["涨跌幅"] > 0:
+            consecutive_up += 1
+        else:
+            break
+
+    # 10日累计涨幅
+    recent_10 = kline.tail(10)
+    first_close = recent_10.iloc[0]["收盘"]
+    last_close = recent_10.iloc[-1]["收盘"]
+    cum_gain = (last_close / first_close - 1) * 100 if first_close > 0 else 0
+
+    penalty = 0
+    warnings = []
+
+    if consecutive_up >= 7:
+        penalty -= 20; warnings.append(f"连涨{consecutive_up}天")
+    elif consecutive_up >= 6:
+        penalty -= 15; warnings.append(f"连涨{consecutive_up}天")
+    elif consecutive_up >= 5:
+        penalty -= 8; warnings.append(f"连涨{consecutive_up}天")
+
+    if cum_gain >= 30:
+        penalty -= 25; warnings.append(f"10日涨{cum_gain:.0f}%")
+    elif cum_gain >= 20:
+        penalty -= 18; warnings.append(f"10日涨{cum_gain:.0f}%")
+    elif cum_gain >= 15:
+        penalty -= 10; warnings.append(f"10日涨{cum_gain:.0f}%")
+
+    if warnings:
+        return penalty, f"追高风险({','.join(warnings)})"
+    return 0, ""
+
+
+def apply_largecap_adjustments(market_cap_yi):
+    """
+    大盘股(>500亿)专属风控调整
+    返回 (threshold_bonus: int, risk_adj: dict or None)
+    threshold_bonus: 该股需要额外多少分才能入选
+    risk_adj: 风控参数覆盖
+    """
+    if not market_cap_yi or market_cap_yi <= 0:
+        return 0, None
+
+    if market_cap_yi >= 2000:
+        return 25, {
+            "仓位上限": 20,
+            "止损收紧": -1.0,  # 额外收紧1%
+            "标签": "超大盘股风控",
+        }
+    elif market_cap_yi >= 500:
+        return 15, {
+            "仓位上限": 30,
+            "止损收紧": -0.5,
+            "标签": "大盘股风控",
+        }
+    return 0, None
+
+
+# ============================================================
+# 国际市场 & AH溢价 & 换手率深度 & 宏观趋势
+# ============================================================
+
+def fetch_global_markets():
+    """
+    获取全球主要指数隔夜表现（东方财富全球指数接口）
+    返回 dict: {指数名: {价格, 涨跌幅}}
+    """
+    # 全球主要指数secid
+    indices = {
+        "道琼斯": "100.DJIA",
+        "标普500": "100.SPX",
+        "纳斯达克": "100.NDX",
+        "恒生指数": "100.HSI",
+        "日经225": "100.N225",
+        "德国DAX": "100.GDAXI",
+        "英国富时": "100.FTSE",
+        "韩国KOSPI": "100.KS11",
+    }
+    result = {}
+    try:
+        ids_str = ",".join(indices.values())
+        resp = _get("http://push2delay.eastmoney.com/api/qt/ulist.np/get",
+                     params={"fltt": 2, "invt": 2, "ut": UT,
+                             "secids": ids_str,
+                             "fields": "f12,f14,f2,f3,f4"},
+                     headers={"Referer": "http://quote.eastmoney.com/"},
+                     timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("diff", []) if data.get("data") else []
+        for item in items:
+            name = item.get("f14", "")
+            chg = item.get("f3", 0)
+            price = item.get("f2", 0)
+            # 匹配已知指数
+            for cn, sid in indices.items():
+                if cn[:2] in name or name in cn:
+                    result[cn] = {"价格": price, "涨跌幅": chg}
+                    break
+            else:
+                # fallback: 用名称作key
+                if name and chg is not None:
+                    result[name] = {"价格": price, "涨跌幅": chg}
+    except Exception:
+        pass
+
+    # 备用：逐个请求
+    if len(result) < 3:
+        for cn, sid in list(indices.items())[:4]:
+            if cn in result:
+                continue
+            try:
+                resp = _get("http://push2delay.eastmoney.com/api/qt/stock/get",
+                            params={"secid": sid, "ut": UT,
+                                    "fields": "f43,f170,f14"},
+                            headers={"Referer": "http://quote.eastmoney.com/"},
+                            timeout=8)
+                d = resp.json().get("data", {})
+                if d:
+                    price = d.get("f43", 0)
+                    chg = d.get("f170", 0)
+                    if isinstance(price, (int, float)) and price > 0:
+                        price = price / 100 if price > 10000 else price
+                    if isinstance(chg, (int, float)):
+                        chg = chg / 100 if abs(chg) > 100 else chg
+                    result[cn] = {"价格": price, "涨跌幅": chg}
+            except Exception:
+                pass
+
+    return result
+
+
+def calc_global_risk(global_markets):
+    """
+    根据全球市场表现计算隔夜风险
+    返回 (penalty: int, warning: str, detail: dict)
+    penalty: 0~-30
+    """
+    if not global_markets:
+        return 0, "", {}
+
+    # 美股权重最大
+    us_indices = ["道琼斯", "标普500", "纳斯达克"]
+    asia_indices = ["恒生指数", "日经225", "韩国KOSPI"]
+    eu_indices = ["德国DAX", "英国富时"]
+
+    def avg_chg(names):
+        vals = [global_markets[n]["涨跌幅"] for n in names if n in global_markets]
+        return sum(vals) / len(vals) if vals else 0
+
+    us_chg = avg_chg(us_indices)
+    asia_chg = avg_chg(asia_indices)
+    eu_chg = avg_chg(eu_indices)
+    all_chg = avg_chg(list(global_markets.keys()))
+
+    penalty = 0
+    warnings = []
+
+    # 美股大跌对A股影响最大
+    if us_chg <= -3:
+        penalty -= 20; warnings.append(f"美股暴跌{us_chg:.1f}%")
+    elif us_chg <= -2:
+        penalty -= 12; warnings.append(f"美股大跌{us_chg:.1f}%")
+    elif us_chg <= -1:
+        penalty -= 5; warnings.append(f"美股下跌{us_chg:.1f}%")
+
+    # 亚太联动
+    if asia_chg <= -2:
+        penalty -= 8; warnings.append(f"亚太下跌{asia_chg:.1f}%")
+    elif asia_chg <= -1:
+        penalty -= 3
+
+    # 全球普跌
+    if all_chg <= -2:
+        penalty -= 5; warnings.append("全球普跌")
+
+    # 美股大涨 → 小幅利好
+    if us_chg >= 2:
+        penalty += 5
+
+    detail = {"美股": us_chg, "亚太": asia_chg, "欧洲": eu_chg}
+    warn_str = f"全球市场风险({', '.join(warnings)})" if warnings else ""
+    return max(penalty, -30), warn_str, detail
+
+
+def fetch_ah_premium():
+    """
+    获取AH股溢价数据（东方财富AH比价接口）
+    返回 dict: {A股代码: {溢价率, H股价格, A股价格, 名称}}
+    """
+    result = {}
+    try:
+        resp = _get("http://push2delay.eastmoney.com/api/qt/clist/get",
+                     params={
+                         "pn": 1, "pz": 200, "po": 1, "np": 1, "fltt": 2,
+                         "invt": 2, "fid": "f164", "fs": "b:DLMK0101",
+                         "ut": UT,
+                         "fields": "f12,f14,f2,f164,f166",
+                     },
+                     headers={"Referer": "http://data.eastmoney.com/"},
+                     timeout=10)
+        data = resp.json()
+        items = data.get("data", {}).get("diff", []) if data.get("data") else []
+        for item in items:
+            code = str(item.get("f12", ""))
+            name = item.get("f14", "")
+            a_price = item.get("f2", 0)
+            premium = item.get("f164", 0)  # 溢价率%
+            if code and premium is not None:
+                result[code] = {
+                    "溢价率": premium,
+                    "A股价格": a_price,
+                    "名称": name,
+                }
+    except Exception:
+        pass
+    return result
+
+
+def check_ah_premium_risk(code, stock_name, ah_data):
+    """
+    AH股溢价风险：溢价率过高 → H股下跌会带动A股补跌
+    返回 (penalty: int, warning: str)
+    """
+    if not ah_data:
+        return 0, ""
+
+    info = ah_data.get(code)
+    if not info:
+        return 0, ""
+
+    premium = info.get("溢价率", 0)
+    if premium >= 150:
+        return -20, f"AH溢价{premium:.0f}%(极高风险)"
+    elif premium >= 100:
+        return -12, f"AH溢价{premium:.0f}%(高)"
+    elif premium >= 60:
+        return -5, f"AH溢价{premium:.0f}%(偏高)"
+    return 0, ""
+
+
+def analyze_turnover_depth(kline, current_turnover=0):
+    """
+    换手率深度分析：不只是过滤，结合价格判断主力行为
+    - 高换手+下跌 = 出货（利空）
+    - 高换手+上涨 = 抢筹（利好）
+    - 低换手+上涨 = 缩量上涨（利好）
+    - 低换手+下跌 = 阴跌（中性偏空）
+    - 换手率突然放大 = 异动
+    返回 (score_adj: int, label: str)
+    """
+    if kline.empty or len(kline) < 5:
+        return 0, ""
+
+    latest = kline.iloc[-1]
+    chg = latest.get("涨跌幅", 0)
+
+    # 近5日平均换手率（从实时数据获取）
+    # 由于腾讯K线不含换手率，我们用成交量变化来推算
+    recent_5 = kline.tail(5)
+    avg_vol = recent_5["成交量"].mean()
+    latest_vol = latest["成交量"]
+    vol_ratio = latest_vol / avg_vol if avg_vol > 0 else 1
+
+    # 用传入的实时换手率
+    turnover = current_turnover if current_turnover > 0 else 0
+
+    score_adj = 0
+    labels = []
+
+    if turnover > 0:
+        # 高换手率分析
+        if turnover >= 15:
+            if chg > 2:
+                score_adj += 3; labels.append(f"天量抢筹(换手{turnover:.1f}%)")
+            elif chg < -2:
+                score_adj -= 8; labels.append(f"天量出货(换手{turnover:.1f}%)")
+            else:
+                score_adj -= 3; labels.append(f"高换手博弈(换手{turnover:.1f}%)")
+        elif turnover >= 8:
+            if chg > 1:
+                score_adj += 2; labels.append(f"放量上攻(换手{turnover:.1f}%)")
+            elif chg < -1:
+                score_adj -= 5; labels.append(f"放量下跌(换手{turnover:.1f}%)")
+
+    # 成交量异动
+    if vol_ratio >= 3:
+        if chg < -1:
+            score_adj -= 5; labels.append(f"量比异动{vol_ratio:.1f}+下跌")
+        elif chg > 1:
+            score_adj += 2; labels.append(f"量比异动{vol_ratio:.1f}+上涨")
+    elif vol_ratio <= 0.3 and chg > 0.5:
+        score_adj += 3; labels.append("地量上涨(惜售)")
+
+    label = "；".join(labels) if labels else ""
+    return score_adj, label
+
+
+def fetch_global_news():
+    """
+    获取国际财经新闻（东方财富国际频道）
+    返回新闻列表，格式同 fetch_news
+    """
+    all_news = []
+
+    # 东方财富全球频道
+    try:
+        resp = _get("https://np-listapi.eastmoney.com/comm/web/getFastNewsList",
+                     params={"client": "web", "biz": "web_news_col",
+                             "fastColumn": "230", "sortEnd": "",  # 230=全球
+                             "pageSize": 30, "req_trace": "t1"},
+                     timeout=10)
+        data = resp.json()
+        for n in data.get("result", {}).get("fastNewsList", []):
+            title = n.get("title", "")
+            summary = n.get("digest", n.get("summary", ""))
+            all_news.append({
+                "来源": "东方财富(国际)",
+                "时间": n.get("showTime", ""),
+                "标题": title,
+                "摘要": summary,
+                "文本": title + " " + summary,
+            })
+    except Exception:
+        pass
+
+    # 新浪全球
+    try:
+        resp = _get("https://feed.mix.sina.com.cn/api/roll/get",
+                     params={"pageid": "155", "lid": "2526",  # 国际财经
+                             "num": 20, "page": 1},
+                     timeout=10)
+        data = resp.json()
+        for item in data.get("result", {}).get("data", []):
+            title = item.get("title", "")
+            intro = item.get("intro", "")
+            all_news.append({
+                "来源": "新浪(国际)",
+                "时间": item.get("ctime", ""),
+                "标题": title,
+                "摘要": intro,
+                "文本": title + " " + intro,
+            })
+    except Exception:
+        pass
+
+    return all_news
+
+
+# 国际宏观风险关键词
+GLOBAL_RISK_KEYWORDS = {
+    # 地缘政治
+    "战争": -8, "军事冲突": -8, "导弹": -6, "封锁": -5,
+    "制裁": -5, "贸易战": -6, "关税": -4, "脱钩": -4,
+    # 美联储/货币政策
+    "加息": -5, "缩表": -4, "鹰派": -4, "紧缩": -3,
+    "美债收益率飙升": -5, "美元走强": -3,
+    # 金融风险
+    "银行危机": -8, "债务违约": -7, "金融危机": -10, "衰退": -5,
+    "崩盘": -6, "暴跌": -4, "恐慌": -5, "黑天鹅": -8,
+    # 供应链
+    "芯片禁令": -5, "出口管制": -5, "断供": -6,
+}
+
+GLOBAL_POSITIVE_KEYWORDS = {
+    # 宏观利好
+    "降息": 6, "宽松": 4, "鸽派": 4, "刺激": 4,
+    "合作": 3, "协议": 3, "缓和": 3,
+    # 科技突破
+    "突破": 2, "创新": 2, "里程碑": 3,
+}
+
+# 宏观产业趋势 → 受益/受损行业映射
+MACRO_TREND_MAP = {
+    # 利好
+    "降息": {"受益": ["金融", "地产", "消费", "科技"], "权重": 5},
+    "芯片": {"受益": ["半导体", "信创", "科技"], "权重": 4},
+    "人工智能": {"受益": ["AI", "算力", "软件"], "权重": 4},
+    "新能源": {"受益": ["新能源", "光伏", "锂电"], "权重": 3},
+    "消费复苏": {"受益": ["消费", "白酒", "零售"], "权重": 3},
+    # 利空
+    "加息": {"受损": ["地产", "金融", "消费"], "权重": -4},
+    "贸易战": {"受损": ["出口", "电子", "纺织"], "权重": -5},
+    "芯片禁令": {"受损": ["半导体", "芯片"], "权重": -6},
+}
+
+
+def analyze_global_news(global_news_list):
+    """
+    分析国际新闻对A股的影响
+    返回 (risk_score: int, trend_industries: dict, key_headlines: list)
+    risk_score: -30 到 +10
+    trend_industries: {行业: 加减分}
+    """
+    risk_score = 0
+    trend_industries = {}  # 行业 -> 累计分
+    key_headlines = []
+
+    for news in global_news_list:
+        text = news["文本"]
+
+        # 风险关键词
+        for kw, pts in GLOBAL_RISK_KEYWORDS.items():
+            if kw in text:
+                risk_score += pts
+                key_headlines.append(f"[国际] {news['标题'][:40]}")
+                break
+
+        # 正面关键词
+        for kw, pts in GLOBAL_POSITIVE_KEYWORDS.items():
+            if kw in text:
+                risk_score += pts
+                break
+
+        # 产业趋势匹配
+        for kw, info in MACRO_TREND_MAP.items():
+            if kw in text:
+                weight = info["权重"]
+                for ind in info.get("受益", []):
+                    trend_industries[ind] = trend_industries.get(ind, 0) + weight
+                for ind in info.get("受损", []):
+                    trend_industries[ind] = trend_industries.get(ind, 0) + weight  # weight已经是负数
+
+    risk_score = max(-30, min(risk_score, 10))
+    return risk_score, trend_industries, list(dict.fromkeys(key_headlines))[:8]
+
+
+def check_macro_trend_fit(stock_industry, stock_name, trend_industries):
+    """
+    检查个股是否契合当前宏观产业趋势
+    返回 (score_adj: int, label: str)
+    """
+    if not trend_industries or not (stock_industry or stock_name):
+        return 0, ""
+
+    best_score = 0
+    best_label = ""
+
+    for ind, pts in trend_industries.items():
+        matched = False
+        if stock_industry and (ind in stock_industry or stock_industry in ind):
+            matched = True
+        if stock_name and ind in stock_name:
+            matched = True
+        if matched:
+            if abs(pts) > abs(best_score):
+                best_score = pts
+                if pts > 0:
+                    best_label = f"契合趋势({ind}+{pts})"
+                else:
+                    best_label = f"逆势行业({ind}{pts})"
+
+    return max(-10, min(best_score, 10)), best_label
+
+
+# ============================================================
 # 市场级熔断：不该买的时候不买
 # ============================================================
 
@@ -1568,15 +2178,62 @@ def apply_weights(signals, weights=None):
     return score, fired_signals
 
 
+# ── 高胜率信号白名单（回测胜率>53%的信号）──
+HIGH_WINRATE_SIGNALS = {
+    "BOLL_触及下轨",     # 59.9%
+    "KDJ_J超卖",         # 54.5%
+    "RSI_回升",           # 54.0%
+    "RSI_极度超卖",       # 53.4%
+    "RSI_超卖",           # 53.0%
+    "MA_突破MA5",         # 52.9%
+    "BOLL_中轨下方",      # 52.9%
+    "MACD_即将金叉",      # 52.1%
+    "KDJ_超卖金叉",       # 51.6%
+    "量价_严重缩量",      # 51.4%
+}
+
+# ── 低胜率信号（回测<49%，不应给正分）──
+LOW_WINRATE_SIGNALS = {
+    "KDJ_多头",           # 49.4%
+    "形态_阳线",          # 48.4%
+    "MACD_红柱",          # 48.5%
+    "MACD_红柱放大",      # 48.1%
+    "MA_多头排列",        # 48.1%
+    "MA_站上MA5",         # 48.1%
+    "RSI_偏高",           # 47.4%
+    "形态_阳包阴",        # 47.5%
+    "量价_放量上涨",      # 45.8%
+    "量价_放量横盘",      # 42.9%
+}
+
+
+def calc_signal_quality(fired_signals):
+    """
+    计算信号质量等级
+    返回 (quality: str, high_count: int, low_count: int)
+    quality: 'A' (>=2个高胜率) / 'B' (1个高胜率) / 'C' (无高胜率)
+    """
+    high = sum(1 for s in fired_signals if s in HIGH_WINRATE_SIGNALS)
+    low = sum(1 for s in fired_signals if s in LOW_WINRATE_SIGNALS)
+    if high >= 2:
+        return 'A', high, low
+    elif high >= 1:
+        return 'B', high, low
+    else:
+        return 'C', high, low
+
+
 # ============================================================
-# 综合评分引擎 v3.0 — 信号驱动
+# 综合评分引擎 v3.2 — 信号驱动 + 胜率优先
 # ============================================================
 
 def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0,
                         fundamental_score=0, fundamental_details=None,
                         extra_score=0, extra_details=None,
                         chip_data=None, tail_flow=None, leader_score=0, leader_label="",
-                        research_data=None, calibrated_weights=None, golden_combos=None):
+                        research_data=None, calibrated_weights=None, golden_combos=None,
+                        commodity_penalty=0, rally_penalty=0,
+                        global_risk=0, ah_penalty=0, turnover_adj=0, macro_adj=0):
     """
     综合评分，十五大维度：
     技术面(信号驱动) + 资金面 + 量价 + 板块 + 情绪 + 形态
@@ -1594,7 +2251,20 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     tech_score, fired = apply_weights(signals, calibrated_weights)
     score = tech_score
 
-    # === 黄金组合加分 ===
+    # === 信号质量评估 ===
+    sig_quality, high_count, low_count = calc_signal_quality(fired)
+
+    # 低胜率信号惩罚：减少垃圾信号堆分
+    if low_count >= 3 and high_count == 0:
+        score -= 10  # 全是低胜率信号，扣分
+
+    # 高胜率信号奖励
+    if high_count >= 3:
+        score += 12  # 3个以上高胜率信号共振，强烈看多
+    elif high_count >= 2:
+        score += 6   # 2个高胜率信号
+
+    # === 黄金组合加分（加大力度）===
     combo_bonus = 0
     matched_combo = ""
     if golden_combos and fired:
@@ -1603,9 +2273,10 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
             combo_sigs = set(combo.get("signals", []))
             if combo_sigs.issubset(fired_set):
                 wr = combo.get("win_rate", 0)
-                bonus = int((wr - 0.55) * 50)  # 58%→1.5, 65%→5, 70%→7.5
+                # 加大黄金组合奖励：70%→15, 75%→20, 80%→25
+                bonus = int((wr - 0.55) * 100)
                 if bonus > combo_bonus:
-                    combo_bonus = min(bonus, 15)
+                    combo_bonus = min(bonus, 30)
                     matched_combo = f"黄金组合({wr:.0%})"
     score += combo_bonus
 
@@ -1756,6 +2427,53 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     if combo_bonus > 0:
         details["组合"] = matched_combo
         reasons.append(matched_combo)
+
+    # === 信号质量标签 ===
+    if sig_quality == 'A':
+        details["信号质量"] = f"A级({high_count}个高胜率)"
+    elif sig_quality == 'B':
+        details["信号质量"] = f"B级({high_count}个高胜率)"
+    else:
+        details["信号质量"] = f"C级(无高胜率信号)"
+
+    # === 大宗商品风险扣分 ===
+    if commodity_penalty and commodity_penalty < 0:
+        score += commodity_penalty
+        details["商品风险"] = f"扣{abs(commodity_penalty)}分"
+
+    # === 追高风险扣分 ===
+    if rally_penalty and rally_penalty < 0:
+        score += rally_penalty
+        details["追高风险"] = f"扣{abs(rally_penalty)}分"
+
+    # === 国际市场隔夜风险 ===
+    if global_risk and global_risk < 0:
+        score += global_risk
+        details["全球市场"] = f"扣{abs(global_risk)}分"
+    elif global_risk and global_risk > 0:
+        score += global_risk
+        details["全球市场"] = f"加{global_risk}分"
+
+    # === AH溢价风险 ===
+    if ah_penalty and ah_penalty < 0:
+        score += ah_penalty
+        details["AH溢价"] = f"扣{abs(ah_penalty)}分"
+
+    # === 换手率深度分析 ===
+    if turnover_adj:
+        score += turnover_adj
+        if turnover_adj > 0:
+            details["换手分析"] = f"加{turnover_adj}分"
+        else:
+            details["换手分析"] = f"扣{abs(turnover_adj)}分"
+
+    # === 宏观趋势匹配 ===
+    if macro_adj:
+        score += macro_adj
+        if macro_adj > 0:
+            details["宏观趋势"] = f"契合+{macro_adj}"
+        else:
+            details["宏观趋势"] = f"逆势{macro_adj}"
 
     reason_str = "；".join(reasons) if reasons else "信号不足"
     return score, details, reason_str
@@ -2673,7 +3391,23 @@ NEWS_NEGATIVE_KEYWORDS = [
     "暴跌", "崩盘", "大跌", "跌停", "利空", "制裁", "打压",
     "退市", "爆雷", "违规", "处罚", "下调", "减持", "清仓",
     "战争", "冲突", "加息",  # 美联储加息
+    # 大宗商品暴跌
+    "油价暴跌", "油价大跌", "原油暴跌", "原油大跌", "原油崩盘",
+    "金价暴跌", "铜价暴跌", "大宗商品暴跌", "商品期货大跌",
+    "OPEC", "供应过剩", "库存大增",
 ]
+
+# 新闻一票否决：匹配到这些关键词 → 相关行业的股票直接排除
+NEWS_VETO_KEYWORDS = {
+    "油价暴跌": ["石油", "石油石化", "化工", "油气", "油服", "海油", "中石油", "中石化"],
+    "原油暴跌": ["石油", "石油石化", "化工", "油气", "油服", "海油", "中石油", "中石化"],
+    "原油崩盘": ["石油", "石油石化", "化工", "油气", "油服", "海油", "中石油", "中石化"],
+    "油价大跌": ["石油", "石油石化", "化工", "油气", "海油"],
+    "原油大跌": ["石油", "石油石化", "化工", "油气", "海油"],
+    "金价暴跌": ["贵金属", "有色金属", "黄金"],
+    "铜价暴跌": ["有色金属", "铜"],
+    "大宗商品暴跌": ["石油", "有色金属", "化工", "农业", "煤炭", "钢铁"],
+}
 
 
 def fetch_news():
@@ -2730,11 +3464,13 @@ def analyze_news_sentiment(news_list):
     - overall_score: 整体市场情绪 (-10 到 +10)
     - hot_concepts: 热门概念及其新闻热度分
     - key_headlines: 关键新闻标题
+    - veto_industries: 被一票否决的行业/关键词集合
     """
     concept_scores = {}  # 概念 -> 累计分数
     positive_count = 0
     negative_count = 0
     key_headlines = []
+    veto_industries = set()
 
     for news in news_list:
         text = news["文本"]
@@ -2755,6 +3491,11 @@ def analyze_news_sentiment(news_list):
                 key_headlines.append(f"[-] {news['标题'][:40]}")
                 break
 
+        # 一票否决扫描
+        for keyword, industries in NEWS_VETO_KEYWORDS.items():
+            if keyword in text:
+                veto_industries.update(industries)
+
     # 整体情绪分 (-10 到 +10)
     total = positive_count + negative_count
     if total == 0:
@@ -2765,7 +3506,7 @@ def analyze_news_sentiment(news_list):
     # 排序热门概念
     hot_concepts = sorted(concept_scores.items(), key=lambda x: x[1], reverse=True)
 
-    return overall, hot_concepts, list(dict.fromkeys(key_headlines))[:10]
+    return overall, hot_concepts, list(dict.fromkeys(key_headlines))[:10], veto_industries
 
 
 # ============================================================
@@ -2790,7 +3531,7 @@ def go_decision():
 
     # ── Step 0: 市场级熔断 ──
     print()
-    print("[0/12] 市场环境检测...")
+    print("[0/13] 市场环境检测...")
     money_effect = calc_money_effect()
     limit_up_pre, limit_down_pre = count_limit_up()
     can_trade, market_reason, market_severity = market_go_nogo(
@@ -2815,12 +3556,63 @@ def go_decision():
     else:
         print(f"  市场环境正常")
 
-    # ── Step 1: 新闻/政策分析 ──
+    # ── Step 0.5: 国际大宗商品 + 全球市场 + AH溢价 ──
     print()
-    print("[1/12] 扫描今日新闻/政策...")
+    print("[0.5/16] 获取国际大宗商品行情...")
+    commodity_data = fetch_commodity_prices()
+    if commodity_data:
+        for cn, info in commodity_data.items():
+            chg = info.get("涨跌幅", 0)
+            flag = "⚠" if chg <= -3 else ""
+            print(f"  {cn}: {info.get('价格', '?')} ({chg:+.1f}%) {flag}")
+    else:
+        print("  未获取到大宗商品数据")
+
+    print()
+    print("[0.6/16] 获取全球市场行情...")
+    global_markets = fetch_global_markets()
+    global_penalty, global_warn, global_detail = calc_global_risk(global_markets)
+    if global_markets:
+        for gn, gi in list(global_markets.items())[:6]:
+            gchg = gi.get("涨跌幅", 0)
+            gflag = "⚠" if gchg <= -1.5 else ("✓" if gchg >= 1 else "")
+            print(f"  {gn}: {gchg:+.1f}% {gflag}")
+    if global_warn:
+        print(f"  ⚠ {global_warn} (扣{abs(global_penalty)}分)")
+
+    print()
+    print("[0.7/16] 获取AH股溢价数据...")
+    ah_data = fetch_ah_premium()
+    if ah_data:
+        high_premium = [(c, d) for c, d in ah_data.items() if d.get("溢价率", 0) >= 100]
+        print(f"  AH股 {len(ah_data)} 只，溢价>100%有 {len(high_premium)} 只")
+    else:
+        print("  未获取到AH溢价数据")
+
+    # ── Step 1: 新闻/政策分析（含国际新闻）──
+    print()
+    print("[1/16] 扫描今日新闻/政策...")
     news = fetch_news()
-    news_score, hot_concepts, key_headlines = analyze_news_sentiment(news)
-    print(f"  获取 {len(news)} 条新闻")
+    global_news = fetch_global_news()
+    all_news = news + global_news
+    news_score, hot_concepts, key_headlines, veto_industries = analyze_news_sentiment(all_news)
+    global_risk_score, trend_industries, global_headlines = analyze_global_news(global_news)
+    print(f"  获取 {len(news)} 条国内新闻 + {len(global_news)} 条国际新闻")
+    if veto_industries:
+        print(f"  ⚠ 新闻一票否决行业: {', '.join(veto_industries)}")
+    if global_risk_score < -5:
+        print(f"  ⚠ 国际宏观风险: {global_risk_score}")
+    if trend_industries:
+        pos = {k: v for k, v in trend_industries.items() if v > 0}
+        neg = {k: v for k, v in trend_industries.items() if v < 0}
+        if pos:
+            print(f"  宏观受益行业: {', '.join([f'{k}(+{v})' for k, v in sorted(pos.items(), key=lambda x: -x[1])[:5]])}")
+        if neg:
+            print(f"  宏观受损行业: {', '.join([f'{k}({v})' for k, v in sorted(neg.items(), key=lambda x: x[1])[:5]])}")
+    if global_headlines:
+        print("  国际关键新闻:")
+        for h in global_headlines[:3]:
+            print(f"    {h}")
 
     if news_score > 3:
         news_mood = "偏多（利好消息较多）"
@@ -2961,17 +3753,45 @@ def go_decision():
         if code in billboard_data or code in limit_up_pool or code in shareholder_data:
             stock_ind = get_stock_industry(code)
             _go_industry_cache[code] = stock_ind
+
+        row = code_to_row.get(code, {})
+        name = str(row.get("名称", ""))
+
+        # ★ 新闻一票否决：行业或名称匹配被否决的关键词
+        if veto_industries:
+            if stock_ind and any(vi in stock_ind for vi in veto_industries):
+                return None
+            if any(vi in name for vi in veto_industries):
+                return None
+
+        # ★ 大宗商品风险
+        commodity_pen, commodity_warn = check_commodity_risk(stock_ind, name, commodity_data)
+
+        # ★ 追高风险
+        rally_pen, rally_warn = check_consecutive_rally(kline)
+
+        # ★ AH溢价风险
+        ah_pen, ah_warn = check_ah_premium_risk(code, name, ah_data)
+
+        # ★ 换手率深度分析
+        current_turnover = row.get("换手率", 0) or 0
+        turnover_adj, turnover_label = analyze_turnover_depth(kline, current_turnover)
+
+        # ★ 宏观趋势匹配
+        macro_adj, macro_label = check_macro_trend_fit(stock_ind, name, trend_industries)
+
         extra_s, extra_d, extra_r = evaluate_extra_dimensions(
             code, billboard_data, margin_data, northbound_total, limit_up, limit_down,
             limit_up_pool, billboard_detail, shareholder_data, industry_data, stock_ind)
 
         s, d, r = evaluate_signals_v2(kline, cap_info, sec_score, sentiment_score,
                                        fund_s, fund_d, extra_s, extra_d,
-                                       calibrated_weights=cal_weights, golden_combos=cal_combos)
+                                       calibrated_weights=cal_weights, golden_combos=cal_combos,
+                                       commodity_penalty=commodity_pen, rally_penalty=rally_pen,
+                                       global_risk=global_penalty, ah_penalty=ah_pen,
+                                       turnover_adj=turnover_adj, macro_adj=macro_adj)
 
         # 新闻热点加分：如果股票名称匹配热门概念
-        row = code_to_row.get(code, {})
-        name = str(row.get("名称", ""))
         news_bonus = 0
         matched_concept = ""
         for concept, bonus in concept_bonus.items():
@@ -2988,16 +3808,39 @@ def go_decision():
             all_reasons = r + "；" + fund_r if r != "信号不足" else fund_r
         if extra_r:
             all_reasons += "；" + extra_r if all_reasons != "信号不足" else extra_r
+        # 附加风险警告
+        risk_warns = [w for w in [commodity_warn, rally_warn, ah_warn, global_warn, turnover_label, macro_label] if w]
+        if risk_warns:
+            all_reasons += "；⚠" + "，".join(risk_warns)
 
-        go_threshold = cal_threshold if cal_weights else 100
+        # ★ 大盘股提高门槛
+        mktcap_yi = row.get("总市值", 0)
+        if isinstance(mktcap_yi, (int, float)) and mktcap_yi > 0:
+            mktcap_yi = mktcap_yi / 1e8  # API返回元，转亿
+        else:
+            mktcap_yi = fund_info.get("总市值", 0) or 0
+        lc_bonus, lc_adj = apply_largecap_adjustments(mktcap_yi)
+
+        go_threshold = (cal_threshold if cal_weights else 100) + lc_bonus
+
+        # ★ 信号质量门槛：一键决策必须有至少1个高胜率信号
+        sig_q = d.get("信号质量", "C级")
+        if "C级" in sig_q:
+            return None  # 无高胜率信号支撑，不推荐
+
         if total_score >= go_threshold:
             latest = kline.iloc[-1]
+            price = row.get("最新价", latest["收盘"])
+            risk = calc_position_and_risk(total_score, sentiment_score,
+                                           northbound_total, limit_up, limit_down, price, kline,
+                                           largecap_adj=lc_adj)
             return {
                 "代码": code, "名称": name,
-                "最新价": row.get("最新价", latest["收盘"]),
+                "最新价": price,
                 "涨跌幅": row.get("涨跌幅", latest["涨跌幅"]),
                 "换手率": row.get("换手率", 0),
                 "评分": total_score,
+                "信号质量": sig_q,
                 "技术分": s - fund_s - extra_s,
                 "基本面分": fund_s,
                 "聪明钱分": extra_s,
@@ -3008,6 +3851,8 @@ def go_decision():
                 "kline": kline,
                 "基本面": fund_info,
                 "行业": _go_industry_cache.get(code, stock_ind),
+                "市值亿": mktcap_yi,
+                "risk": risk,
             }
         return None
 
@@ -3062,14 +3907,17 @@ def go_decision():
         latest = kline.iloc[-1]
         price = stock["最新价"]
 
-        # 使用智能风控系统计算动态仓位和止损止盈
-        risk = calc_position_and_risk(stock["评分"], sentiment_score,
-                                       northbound_total, limit_up, limit_down, price, kline)
+        # 使用预计算的风控结果（已包含大盘股调整）
+        risk = stock.get("risk") or calc_position_and_risk(
+            stock["评分"], sentiment_score,
+            northbound_total, limit_up, limit_down, price, kline)
 
         print()
         print(f"  ━━━ 第{i+1}只: {stock['名称']}({stock['代码']}) ━━━")
         print()
         print(f"  现价: {price:.2f}   今日涨幅: {stock['涨跌幅']:+.2f}%")
+        if stock.get("市值亿") and stock["市值亿"] >= 500:
+            print(f"  市值: {stock['市值亿']:.0f}亿 (大盘股风控已启用)")
         if stock.get("行业"):
             print(f"  行业: {stock['行业']}")
         print(f"  评分: {stock['评分']}/280")
@@ -3165,6 +4013,17 @@ def go_decision():
     # 聪明钱加分
     if selected[0].get("聪明钱分", 0) >= 30:
         confidence += 5
+    # 信号质量加分
+    top_sig_q = selected[0].get("信号质量", "")
+    if "A级" in top_sig_q:
+        confidence += 10
+    elif "B级" in top_sig_q:
+        confidence += 3
+    # 全球风险减分
+    if global_penalty < -10:
+        confidence -= 10
+    elif global_penalty < -5:
+        confidence -= 5
     confidence = max(20, min(confidence, 95))
 
     confidence = int(confidence)
@@ -3623,7 +4482,7 @@ def etf_go(top_n=3):
     print()
     print("[2/5] 扫描新闻热点...")
     news = fetch_news()
-    news_score, hot_concepts, key_headlines = analyze_news_sentiment(news)
+    news_score, hot_concepts, key_headlines, _ = analyze_news_sentiment(news)
     news_mood = "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空"
     print(f"  新闻情绪: {news_mood}")
     if hot_concepts:

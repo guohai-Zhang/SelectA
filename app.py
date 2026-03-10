@@ -130,6 +130,7 @@ def api_stock(code: str):
             f_ind = ex.submit(t1.fetch_industry_prosperity)
             f_ind_code = ex.submit(t1.get_stock_industry, code)
             f_rt = ex.submit(t1.fetch_realtime_sina, [code])
+            f_commodity = ex.submit(t1.fetch_commodity_prices)
 
         cap_rank = f_cap_rank.result()
         cap_flow = f_cap_flow.result()
@@ -146,6 +147,7 @@ def api_stock(code: str):
         industry_data = f_ind.result()
         stock_industry = f_ind_code.result()
         rt = f_rt.result()
+        commodity_data = f_commodity.result()
 
         name = rt.get(code, {}).get("名称", code)
 
@@ -154,6 +156,17 @@ def api_stock(code: str):
         if fund_detail:
             fund_info.update({k: v for k, v in fund_detail.items() if v is not None})
         fund_s, fund_d, fund_r = t1.evaluate_fundamentals(fund_info)
+
+        # ★ 多维度风险检测
+        commodity_pen, commodity_warn = t1.check_commodity_risk(stock_industry, name, commodity_data)
+        rally_pen, rally_warn = t1.check_consecutive_rally(kline)
+        ah_data = t1.fetch_ah_premium()
+        ah_pen, ah_warn = t1.check_ah_premium_risk(code, name, ah_data)
+        global_markets = t1.fetch_global_markets()
+        global_penalty, global_warn_str, _ = t1.calc_global_risk(global_markets)
+        # 换手率深度（从实时数据获取）
+        rt_info = rt.get(code, {})
+        turnover_adj_val, turnover_label = t1.analyze_turnover_depth(kline, 0)
 
         # 额外维度
         extra_s, extra_d, extra_r = t1.evaluate_extra_dimensions(
@@ -165,12 +178,20 @@ def api_stock(code: str):
         cal_weights, cal_threshold, cal_combos = t1.load_calibrated_weights()
         score, details, reasons = t1.evaluate_signals_v2(
             kline, cap_info, 8, sentiment_score, fund_s, fund_d, extra_s, extra_d,
-            calibrated_weights=cal_weights, golden_combos=cal_combos)
+            calibrated_weights=cal_weights, golden_combos=cal_combos,
+            commodity_penalty=commodity_pen, rally_penalty=rally_pen,
+            global_risk=global_penalty, ah_penalty=ah_pen,
+            turnover_adj=turnover_adj_val)
+
+        # ★ 大盘股风控
+        mktcap_yi = fund_info.get("总市值", 0) or 0
+        _, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
 
         # 风控
         price = float(latest["收盘"])
         risk = t1.calc_position_and_risk(
-            score, sentiment_score, nb_total, limit_up, limit_down, price, kline)
+            score, sentiment_score, nb_total, limit_up, limit_down, price, kline,
+            largecap_adj=lc_adj)
 
         # 近10日K线
         recent_kline = []
@@ -186,6 +207,9 @@ def api_stock(code: str):
             for _, r in cap_flow.tail(5).iterrows():
                 recent_flow.append({"日期": r["日期"], "主力净流入": r["主力净流入"]})
 
+        # 风险警告
+        risk_warnings = [w for w in [commodity_warn, rally_warn, ah_warn, global_warn_str, turnover_label] if w]
+
         return jsonable({
             "code": code, "name": name,
             "price": price,
@@ -197,9 +221,12 @@ def api_stock(code: str):
             "fund_score": fund_s,
             "extra_score": extra_s,
             "risk": risk,
+            "risk_warnings": risk_warnings,
             "sentiment": {"score": sentiment_score, "info": sentiment_info},
             "northbound": {"total": nb_total, "info": nb_info},
             "industry": stock_industry,
+            "commodity": commodity_data,
+            "global_markets": global_markets,
             "kline": recent_kline,
             "capital_flow": recent_flow,
             "capital_info": cap_info,
@@ -227,8 +254,12 @@ def api_scan(top: int = Query(15, ge=1, le=50)):
                 yield sse({"type": "blocked", "msg": f"市场熔断: {market_reason}，今日禁止操作！"})
                 return
 
-            yield sse({"type": "progress", "msg": "获取市场情绪...", "pct": 10})
+            yield sse({"type": "progress", "msg": "获取市场情绪+全球数据...", "pct": 10})
             sentiment_score, sentiment_info = t1.get_sentiment_score()
+            commodity_data = t1.fetch_commodity_prices()
+            global_markets = t1.fetch_global_markets()
+            global_penalty, _, _ = t1.calc_global_risk(global_markets)
+            ah_data = t1.fetch_ah_premium()
 
             yield sse({"type": "progress", "msg": "获取板块/资金/龙虎榜...", "pct": 15})
             hot_sectors = t1.get_hot_sectors()
@@ -281,22 +312,42 @@ def api_scan(top: int = Query(15, ge=1, le=50)):
                 stock_ind = ""
                 if code in billboard_data or code in limit_up_pool or code in shareholder_data:
                     stock_ind = t1.get_stock_industry(code)
+                row = code_to_row.get(code, {})
+                name = str(row.get("名称", ""))
+                # ★ 多维度风险检测
+                commodity_pen, commodity_warn = t1.check_commodity_risk(stock_ind, name, commodity_data)
+                rally_pen, rally_warn = t1.check_consecutive_rally(kl)
+                ah_pen, ah_warn = t1.check_ah_premium_risk(code, name, ah_data)
+                current_turnover = row.get("换手率", 0) or 0
+                turnover_adj_val, turnover_label = t1.analyze_turnover_depth(kl, current_turnover)
                 es, ed, er = t1.evaluate_extra_dimensions(
                     code, billboard_data, margin_data, nb_total, limit_up, limit_down,
                     limit_up_pool, billboard_detail, shareholder_data, industry_data, stock_ind)
                 s, d, r = t1.evaluate_signals_v2(
                     kl, cap_info, sec_score, sentiment_score, fs, fd, es, ed,
-                    calibrated_weights=cal_weights, golden_combos=cal_combos)
+                    calibrated_weights=cal_weights, golden_combos=cal_combos,
+                    commodity_penalty=commodity_pen, rally_penalty=rally_pen,
+                    global_risk=global_penalty, ah_penalty=ah_pen,
+                    turnover_adj=turnover_adj_val)
                 combined = r
                 if fr:
                     combined = r + "；" + fr if r != "信号不足" else fr
                 if er:
                     combined += "；" + er if combined != "信号不足" else er
-                scan_th = cal_threshold if cal_weights else 90
+                risk_warns = [w for w in [commodity_warn, rally_warn, ah_warn, turnover_label] if w]
+                if risk_warns:
+                    combined += "；⚠" + "，".join(risk_warns)
+                # ★ 大盘股提高门槛
+                mktcap_yi = row.get("总市值", 0)
+                if isinstance(mktcap_yi, (int, float)) and mktcap_yi > 0:
+                    mktcap_yi = mktcap_yi / 1e8
+                else:
+                    mktcap_yi = fi.get("总市值", 0) or 0
+                lc_bonus, _ = t1.apply_largecap_adjustments(mktcap_yi)
+                scan_th = (cal_threshold if cal_weights else 90) + lc_bonus
                 if s >= scan_th:
-                    row = code_to_row.get(code, {})
                     return {
-                        "代码": code, "名称": row.get("名称", ""),
+                        "代码": code, "名称": name,
                         "最新价": row.get("最新价", 0), "涨跌幅": row.get("涨跌幅", 0),
                         "换手率": row.get("换手率", 0), "评分": s,
                         "信号": d, "理由": combined,
@@ -354,9 +405,18 @@ def api_go():
                 yield sse({"type": "blocked", "msg": f"市场熔断: {market_reason}，今日禁止操作！"})
                 return
 
-            yield sse({"type": "progress", "msg": "扫描新闻/政策...", "pct": 5})
+            yield sse({"type": "progress", "msg": "获取大宗商品+全球市场+AH溢价...", "pct": 4})
+            commodity_data = t1.fetch_commodity_prices()
+            global_markets = t1.fetch_global_markets()
+            global_penalty, global_warn, global_detail = t1.calc_global_risk(global_markets)
+            ah_data = t1.fetch_ah_premium()
+
+            yield sse({"type": "progress", "msg": "扫描国内+国际新闻...", "pct": 5})
             news = t1.fetch_news()
-            news_score, hot_concepts, key_headlines = t1.analyze_news_sentiment(news)
+            global_news = t1.fetch_global_news()
+            all_news_combined = news + global_news
+            news_score, hot_concepts, key_headlines, veto_industries = t1.analyze_news_sentiment(all_news_combined)
+            global_risk_score, trend_industries, global_headlines = t1.analyze_global_news(global_news)
             news_mood = "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空"
 
             yield sse({"type": "progress", "msg": "分析大盘情绪...", "pct": 8})
@@ -421,14 +481,30 @@ def api_go():
                 stock_ind = ""
                 if code in billboard_data or code in limit_up_pool or code in shareholder_data:
                     stock_ind = t1.get_stock_industry(code)
+                row = code_to_row.get(code, {})
+                name = str(row.get("名称", ""))
+                # ★ 新闻一票否决
+                if veto_industries:
+                    if stock_ind and any(vi in stock_ind for vi in veto_industries):
+                        return None
+                    if any(vi in name for vi in veto_industries):
+                        return None
+                # ★ 多维度风险检测
+                commodity_pen, commodity_warn = t1.check_commodity_risk(stock_ind, name, commodity_data)
+                rally_pen, rally_warn = t1.check_consecutive_rally(kl)
+                ah_pen, ah_warn = t1.check_ah_premium_risk(code, name, ah_data)
+                current_turnover = row.get("换手率", 0) or 0
+                turnover_adj_val, turnover_label = t1.analyze_turnover_depth(kl, current_turnover)
+                macro_adj_val, macro_label = t1.check_macro_trend_fit(stock_ind, name, trend_industries)
                 es, ed, er = t1.evaluate_extra_dimensions(
                     code, billboard_data, margin_data, nb_total, limit_up, limit_down,
                     limit_up_pool, billboard_detail, shareholder_data, industry_data, stock_ind)
                 s, d, r = t1.evaluate_signals_v2(
                     kl, cap_info, sec_score, sentiment_score, fs, fd, es, ed,
-                    calibrated_weights=cal_weights, golden_combos=cal_combos)
-                row = code_to_row.get(code, {})
-                name = str(row.get("名称", ""))
+                    calibrated_weights=cal_weights, golden_combos=cal_combos,
+                    commodity_penalty=commodity_pen, rally_penalty=rally_pen,
+                    global_risk=global_penalty, ah_penalty=ah_pen,
+                    turnover_adj=turnover_adj_val, macro_adj=macro_adj_val)
                 news_bonus = 0
                 matched_concept = ""
                 for concept, bonus in concept_bonus.items():
@@ -442,18 +518,34 @@ def api_go():
                     all_reasons = r + "；" + fr if r != "信号不足" else fr
                 if er:
                     all_reasons += "；" + er if all_reasons != "信号不足" else er
-                go_th = cal_threshold if cal_weights else 100
+                risk_warns = [w for w in [commodity_warn, rally_warn, ah_warn, global_warn, turnover_label, macro_label] if w]
+                if risk_warns:
+                    all_reasons += "；⚠" + "，".join(risk_warns)
+                # ★ 大盘股提高门槛
+                mktcap_yi = row.get("总市值", 0)
+                if isinstance(mktcap_yi, (int, float)) and mktcap_yi > 0:
+                    mktcap_yi = mktcap_yi / 1e8
+                else:
+                    mktcap_yi = fi.get("总市值", 0) or 0
+                lc_bonus, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
+                go_th = (cal_threshold if cal_weights else 100) + lc_bonus
+                # ★ 信号质量门槛
+                sig_q = d.get("信号质量", "C级")
+                if "C级" in sig_q:
+                    return None
                 if total_score >= go_th:
                     latest = kl.iloc[-1]
-                    price = float(latest["收盘"])
+                    price = float(row.get("最新价", latest["收盘"]))
                     risk = t1.calc_position_and_risk(
-                        total_score, sentiment_score, nb_total, limit_up, limit_down, price, kl)
+                        total_score, sentiment_score, nb_total, limit_up, limit_down, price, kl,
+                        largecap_adj=lc_adj)
                     return {
                         "代码": code, "名称": name,
-                        "最新价": row.get("最新价", price),
+                        "最新价": price,
                         "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
                         "换手率": row.get("换手率", 0),
                         "评分": total_score,
+                        "信号质量": sig_q,
                         "技术分": s - fs - es,
                         "基本面分": fs,
                         "聪明钱分": es,
@@ -543,6 +635,12 @@ def api_go():
                     "market_status": {"can_trade": can_trade, "reason": market_reason,
                                       "severity": severity},
                     "money_effect": money_effect,
+                    "commodity": commodity_data,
+                    "global_markets": global_markets,
+                    "global_risk": global_penalty,
+                    "global_headlines": global_headlines[:5] if global_headlines else [],
+                    "trend_industries": trend_industries,
+                    "veto_industries": list(veto_industries) if veto_industries else [],
                 },
             }})
         except Exception as e:
@@ -583,7 +681,7 @@ def api_etf():
 
             # 新闻热点
             news = t1.fetch_news()
-            news_score, hot_concepts, _ = t1.analyze_news_sentiment(news)
+            news_score, hot_concepts, _, _ = t1.analyze_news_sentiment(news)
 
             def analyze(code):
                 kl = t1.fetch_kline(code, days=120)

@@ -417,20 +417,36 @@ function renderGoResults(data) {
   const mi = data.market_info || {};
   if (!sel.length) {
     $('#go-results').innerHTML = '<div class="card" style="text-align:center;padding:30px;color:var(--text2)">' +
-      (data.msg || '今日无合适标的，建议观望') + '</div>';
+      (data.msg || '今日未扫描到候选，市场可能极端低迷') + '</div>';
     return;
   }
   let html = '';
+
+  // 市场熔断警告
+  const ms = (mi.market_status || {});
+  if (ms.severity >= 3) {
+    html += `<div class="card" style="border:2px solid var(--red);text-align:center;padding:12px;margin-bottom:12px">
+      <div style="color:var(--red);font-weight:700;font-size:15px">!! 市场熔断: ${ms.reason || ''}</div>
+      <div style="color:var(--text2);font-size:12px;margin-top:4px">强烈建议空仓！以下推荐仅供参考</div>
+    </div>`;
+  } else if (ms.severity >= 2) {
+    html += `<div class="card" style="border:1px solid var(--gold);text-align:center;padding:10px;margin-bottom:12px">
+      <div style="color:var(--gold);font-weight:600;font-size:14px">${ms.reason || ''} — 建议观望或极轻仓</div>
+    </div>`;
+  }
 
   // 推荐股票
   sel.forEach((s, i) => {
     const rk = s.risk || {};
     const c = chgClass(s['涨跌幅']);
-    html += `<div class="go-stock">
+    const rl = s['推荐等级'] || '仅参考';
+    const rlColor = rl === '强推荐' ? 'var(--red)' : rl.includes('推荐') ? 'var(--gold)' : 'var(--text2)';
+    const borderColor = rl === '强推荐' ? 'var(--red)' : rl.includes('推荐') ? 'var(--gold)' : 'var(--border)';
+    html += `<div class="go-stock" style="border-color:${borderColor}">
       <div class="go-stock-header">
         <div>
           <div class="go-stock-name">第${i+1}只: ${s['名称']}(${s['代码']})</div>
-          <div style="font-size:12px;color:var(--text2)">${s['行业'] || ''}</div>
+          <div style="font-size:12px"><span style="color:${rlColor};font-weight:600">${rl}</span> <span style="color:var(--text2)">${s['行业'] || ''}</span></div>
         </div>
         <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/280</span></div>
       </div>

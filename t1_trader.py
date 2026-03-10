@@ -3629,9 +3629,8 @@ def go_decision():
         print()
         print("  " + "!" * 50)
         print(f"  !! 市场熔断: {market_reason}")
-        print("  !! 今日禁止操作，空仓观望！")
+        print("  !! 强烈建议空仓！以下推荐仅供参考")
         print("  " + "!" * 50)
-        return
     elif market_severity >= 2:
         print(f"  [警告] {market_reason} — 建议观望或极轻仓")
     elif market_severity >= 1:
@@ -3904,40 +3903,45 @@ def go_decision():
             mktcap_yi = fund_info.get("总市值", 0) or 0
         lc_bonus, lc_adj = apply_largecap_adjustments(mktcap_yi)
 
-        go_threshold = (cal_threshold if cal_weights else 100) + lc_bonus
-
-        # ★ 信号质量门槛：一键决策必须有至少1个高胜率信号
         sig_q = d.get("信号质量", "C级")
-        if "C级" in sig_q:
-            return None  # 无高胜率信号支撑，不推荐
 
-        if total_score >= go_threshold:
-            latest = kline.iloc[-1]
-            price = row.get("最新价", latest["收盘"])
-            risk = calc_position_and_risk(total_score, sentiment_score,
-                                           northbound_total, limit_up, limit_down, price, kline,
-                                           largecap_adj=lc_adj)
-            return {
-                "代码": code, "名称": name,
-                "最新价": price,
-                "涨跌幅": row.get("涨跌幅", latest["涨跌幅"]),
-                "换手率": row.get("换手率", 0),
-                "评分": total_score,
-                "信号质量": sig_q,
-                "技术分": s - fund_s - extra_s,
-                "基本面分": fund_s,
-                "聪明钱分": extra_s,
-                "新闻加分": news_bonus,
-                "匹配概念": matched_concept,
-                "信号": d, "理由": all_reasons,
-                "主力净流入占比": cap_info.get("主力净流入占比", 0) if cap_info else 0,
-                "kline": kline,
-                "基本面": fund_info,
-                "行业": _go_industry_cache.get(code, stock_ind),
-                "市值亿": mktcap_yi,
-                "risk": risk,
-            }
-        return None
+        # 判断推荐等级
+        go_threshold = (cal_threshold if cal_weights else 100) + lc_bonus
+        if total_score >= go_threshold and "C级" not in sig_q:
+            rec_level = "强推荐"
+        elif total_score >= go_threshold:
+            rec_level = "推荐(信号偏弱)"
+        elif total_score >= go_threshold * 0.7:
+            rec_level = "弱推荐"
+        else:
+            rec_level = "仅参考"
+
+        latest = kline.iloc[-1]
+        price = row.get("最新价", latest["收盘"])
+        risk = calc_position_and_risk(total_score, sentiment_score,
+                                       northbound_total, limit_up, limit_down, price, kline,
+                                       largecap_adj=lc_adj)
+        return {
+            "代码": code, "名称": name,
+            "最新价": price,
+            "涨跌幅": row.get("涨跌幅", latest["涨跌幅"]),
+            "换手率": row.get("换手率", 0),
+            "评分": total_score,
+            "信号质量": sig_q,
+            "推荐等级": rec_level,
+            "技术分": s - fund_s - extra_s,
+            "基本面分": fund_s,
+            "聪明钱分": extra_s,
+            "新闻加分": news_bonus,
+            "匹配概念": matched_concept,
+            "信号": d, "理由": all_reasons,
+            "主力净流入占比": cap_info.get("主力净流入占比", 0) if cap_info else 0,
+            "kline": kline,
+            "基本面": fund_info,
+            "行业": _go_industry_cache.get(code, stock_ind),
+            "市值亿": mktcap_yi,
+            "risk": risk,
+        }
 
     done = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -3957,7 +3961,7 @@ def go_decision():
 
     if not results:
         print()
-        print("  今日无合适标的，建议观望。")
+        print("  今日未扫描到任何候选，市场可能极端低迷。")
         return
 
     # ── 排序选股 ──
@@ -3979,10 +3983,20 @@ def go_decision():
         if r not in selected:
             selected.append(r)
 
+    # 判断整体推荐强度
+    top_score = selected[0]["评分"]
+    go_threshold = cal_threshold if cal_weights else 100
+    has_strong = any(s.get("推荐等级", "") == "强推荐" for s in selected)
+
     # ── 输出决策 ──
     print()
     print("=" * 65)
-    print("  ★★★ 今日操作建议 ★★★")
+    if has_strong:
+        print("  ★★★ 今日操作建议 ★★★")
+    elif top_score >= go_threshold:
+        print("  ★★ 今日操作建议（信号一般，轻仓参与）★★")
+    else:
+        print("  ★ 今日 TOP3 参考（信号偏弱，谨慎操作）★")
     print("=" * 65)
 
     for i, stock in enumerate(selected):
@@ -3995,8 +4009,9 @@ def go_decision():
             stock["评分"], sentiment_score,
             northbound_total, limit_up, limit_down, price, kline)
 
+        rec_level = stock.get("推荐等级", "仅参考")
         print()
-        print(f"  ━━━ 第{i+1}只: {stock['名称']}({stock['代码']}) ━━━")
+        print(f"  ━━━ 第{i+1}只: {stock['名称']}({stock['代码']}) [{rec_level}] ━━━")
         print()
         print(f"  现价: {price:.2f}   今日涨幅: {stock['涨跌幅']:+.2f}%")
         if stock.get("市值亿") and stock["市值亿"] >= 500:

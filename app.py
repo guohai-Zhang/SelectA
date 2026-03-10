@@ -401,9 +401,7 @@ def api_go():
             can_trade, market_reason, severity = t1.market_go_nogo(
                 money_effect, limit_up=limit_up_pre, limit_down=limit_down_pre)
 
-            if severity >= 3:
-                yield sse({"type": "blocked", "msg": f"市场熔断: {market_reason}，今日禁止操作！"})
-                return
+            market_blocked = severity >= 3
 
             yield sse({"type": "progress", "msg": "获取大宗商品+全球市场+AH溢价...", "pct": 4})
             commodity_data = t1.fetch_commodity_prices()
@@ -529,35 +527,40 @@ def api_go():
                     mktcap_yi = fi.get("总市值", 0) or 0
                 lc_bonus, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
                 go_th = (cal_threshold if cal_weights else 100) + lc_bonus
-                # ★ 信号质量门槛
                 sig_q = d.get("信号质量", "C级")
-                if "C级" in sig_q:
-                    return None
-                if total_score >= go_th:
-                    latest = kl.iloc[-1]
-                    price = float(row.get("最新价", latest["收盘"]))
-                    risk = t1.calc_position_and_risk(
-                        total_score, sentiment_score, nb_total, limit_up, limit_down, price, kl,
-                        largecap_adj=lc_adj)
-                    return {
-                        "代码": code, "名称": name,
-                        "最新价": price,
-                        "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
-                        "换手率": row.get("换手率", 0),
-                        "评分": total_score,
-                        "信号质量": sig_q,
-                        "技术分": s - fs - es,
-                        "基本面分": fs,
-                        "聪明钱分": es,
-                        "新闻加分": news_bonus,
-                        "匹配概念": matched_concept,
-                        "信号": d, "理由": all_reasons,
-                        "主力净流入占比": cap_info.get("主力净流入占比", 0) if cap_info else 0,
-                        "基本面": fi,
-                        "行业": stock_ind,
-                        "risk": risk,
-                    }
-                return None
+                # 判断推荐等级
+                if total_score >= go_th and "C级" not in sig_q:
+                    rec_level = "强推荐"
+                elif total_score >= go_th:
+                    rec_level = "推荐(信号偏弱)"
+                elif total_score >= go_th * 0.7:
+                    rec_level = "弱推荐"
+                else:
+                    rec_level = "仅参考"
+                latest = kl.iloc[-1]
+                price = float(row.get("最新价", latest["收盘"]))
+                risk = t1.calc_position_and_risk(
+                    total_score, sentiment_score, nb_total, limit_up, limit_down, price, kl,
+                    largecap_adj=lc_adj)
+                return {
+                    "代码": code, "名称": name,
+                    "最新价": price,
+                    "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
+                    "换手率": row.get("换手率", 0),
+                    "评分": total_score,
+                    "信号质量": sig_q,
+                    "推荐等级": rec_level,
+                    "技术分": s - fs - es,
+                    "基本面分": fs,
+                    "聪明钱分": es,
+                    "新闻加分": news_bonus,
+                    "匹配概念": matched_concept,
+                    "信号": d, "理由": all_reasons,
+                    "主力净流入占比": cap_info.get("主力净流入占比", 0) if cap_info else 0,
+                    "基本面": fi,
+                    "行业": stock_ind,
+                    "risk": risk,
+                }
 
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {executor.submit(analyze_for_go, c): c for c in analyze_list}
@@ -577,8 +580,8 @@ def api_go():
 
             if not results:
                 yield sse({"type": "result", "data": {
-                    "selected": [], "confidence": 30,
-                    "msg": "今日无合适标的，建议观望。"
+                    "selected": [], "confidence": 20,
+                    "msg": "今日未扫描到任何候选，市场可能极端低迷。"
                 }})
                 return
 
@@ -610,6 +613,9 @@ def api_go():
                 confidence += 10
             if selected[0].get("聪明钱分", 0) >= 30:
                 confidence += 5
+            # 市场熔断时降低信心
+            if market_blocked:
+                confidence -= 25
             confidence = max(20, min(confidence, 95))
 
             # 连板统计

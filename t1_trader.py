@@ -240,6 +240,7 @@ def fetch_stock_list_sina():
         df["名称"] = df["名称"].astype(str)
         df = df[df["最新价"] != "-"]
         df = df[~df["名称"].str.contains("ST|退市|N |C ", na=False)]
+        df = df[~df["代码"].str.startswith("3")]  # 剔除创业板(300xxx)
         num_cols = ["最新价","涨跌幅","成交量","成交额","振幅","换手率","量比","最高","最低","今开","昨收","总市值","流通市值"]
         for col in num_cols:
             if col in df.columns:

@@ -19,6 +19,8 @@ A股 T+1 短线分析工具 v3.0
     python3 t1_trader.py --market       # 查看大盘情绪
     python3 t1_trader.py --sector       # 查看板块资金流向
     python3 t1_trader.py --go           # 一键决策：直接推荐3只股票+明日卖出策略
+    python3 t1_trader.py --etf          # ETF波段扫描（持有1-5天）
+    python3 t1_trader.py --etf-go       # ETF波段一键决策：推荐3只ETF+操作计划
 """
 
 import requests
@@ -3184,6 +3186,608 @@ def go_decision():
 
 
 # ============================================================
+# ETF 波段分析（持有1-5天）
+# ============================================================
+
+# 场内ETF市场代码
+FS_ETF = "b:MK0021,b:MK0022,b:MK0023,b:MK0024"
+
+# ETF主题分类（名称关键词 -> 板块）
+ETF_THEME_MAP = {
+    "沪深300": "大盘", "上证50": "大盘", "中证500": "中盘", "中证1000": "小盘",
+    "创业板": "成长", "科创": "成长", "双创": "成长",
+    "半导体": "半导体", "芯片": "半导体", "集成电路": "半导体",
+    "新能源": "新能源", "光伏": "新能源", "锂电": "新能源", "碳中和": "新能源", "电力": "新能源",
+    "军工": "军工", "国防": "军工",
+    "医药": "医药", "医疗": "医药", "生物": "医药", "创新药": "医药", "中药": "医药",
+    "消费": "消费", "食品": "消费", "白酒": "消费", "家电": "消费",
+    "金融": "金融", "银行": "金融", "券商": "金融", "证券": "金融", "保险": "金融",
+    "地产": "地产", "房地产": "地产", "基建": "地产",
+    "科技": "科技", "人工智能": "AI", "AI": "AI", "机器人": "机器人",
+    "通信": "通信", "5G": "通信",
+    "有色": "资源", "煤炭": "资源", "钢铁": "资源", "石油": "资源", "黄金": "黄金",
+    "农业": "农业", "养殖": "农业",
+    "港股": "港股", "恒生": "港股", "H股": "港股",
+    "纳斯达克": "美股", "标普": "美股", "中概": "美股",
+    "债": "债券", "国债": "债券",
+    "红利": "红利", "高股息": "红利", "央企": "央企", "国企": "央企",
+}
+
+
+def get_etf_theme(name):
+    """根据ETF名称识别主题"""
+    for keyword, theme in ETF_THEME_MAP.items():
+        if keyword in name:
+            return theme
+    return "其他"
+
+
+def fetch_etf_list():
+    """获取场内ETF列表（含实时行情）"""
+    url = "http://push2delay.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": 1, "pz": 2000, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+        "fid": "f3", "fs": FS_ETF, "ut": UT,
+        "fields": "f12,f14,f2,f3,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21"
+    }
+    try:
+        resp = _get(url, params=params, headers={"Referer": "http://data.eastmoney.com/"})
+        data = resp.json()
+        if not (data.get("data") and data["data"].get("diff")):
+            return pd.DataFrame()
+        df = pd.DataFrame(data["data"]["diff"])
+        col_map = {
+            "f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅",
+            "f5": "成交量", "f6": "成交额", "f7": "振幅", "f8": "换手率",
+            "f10": "量比", "f15": "最高", "f16": "最低",
+            "f17": "今开", "f18": "昨收", "f20": "总市值", "f21": "流通市值"
+        }
+        df = df.rename(columns=col_map)
+        df["代码"] = df["代码"].astype(str)
+        df["名称"] = df["名称"].astype(str)
+        df = df[df["最新价"] != "-"]
+        num_cols = ["最新价", "涨跌幅", "成交量", "成交额", "振幅", "换手率", "量比",
+                    "最高", "最低", "今开", "昨收", "总市值", "流通市值"]
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["最新价"])
+        df = df[df["最新价"] > 0]
+        # 过滤掉规模太小和成交太低的
+        df = df[df["成交额"] > 1e7]  # 日成交额 > 1000万
+        # 添加主题分类
+        df["主题"] = df["名称"].apply(get_etf_theme)
+        # 过滤债券/货币ETF（不适合波段）
+        df = df[~df["主题"].isin(["债券"])]
+        return df
+    except Exception as e:
+        print(f"[错误] 获取ETF列表失败: {e}")
+        return pd.DataFrame()
+
+
+def evaluate_etf_trend(df):
+    """
+    ETF趋势评分（满分100），波段策略核心：追强势趋势
+    1. 趋势强度 (0-30): MA排列 + 价格位置
+    2. 动量信号 (0-25): MACD/KDJ/RSI
+    3. 量价配合 (0-20): 放量突破 vs 缩量回调
+    4. 波段位置 (0-15): 是否在合适的买入位
+    5. 波动率 (0-10): 适中波动最佳
+    """
+    if len(df) < 30:
+        return 0, {}, ""
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    score = 0
+    details = {}
+    reasons = []
+
+    # === 1. 趋势强度 (0-30) ===
+    trend_s = 0
+    ma5, ma10, ma20 = latest.get("MA5", 0), latest.get("MA10", 0), latest.get("MA20", 0)
+    ma60 = latest.get("MA60", 0) if "MA60" in df.columns else 0
+    price = latest["收盘"]
+
+    if ma5 > ma10 > ma20 and (ma60 == 0 or ma20 > ma60):
+        trend_s = 30; details["趋势"] = "强势多头排列"
+        reasons.append("多头排列")
+    elif ma5 > ma10 > ma20:
+        trend_s = 25; details["趋势"] = "多头排列"
+        reasons.append("多头排列")
+    elif ma5 > ma10 and price > ma20:
+        trend_s = 20; details["趋势"] = "短期多头+站上MA20"
+    elif ma5 > ma10:
+        trend_s = 15; details["趋势"] = "短期多头"
+    elif price > ma5 and prev["收盘"] <= prev.get("MA5", 0):
+        trend_s = 18; details["趋势"] = "突破MA5"
+        reasons.append("突破MA5")
+    elif price > ma20:
+        trend_s = 10; details["趋势"] = "站上MA20"
+    else:
+        trend_s = 3; details["趋势"] = "偏弱"
+
+    # 近5日涨幅加成
+    if len(df) >= 5:
+        chg_5d = (price - df.iloc[-5]["收盘"]) / df.iloc[-5]["收盘"] * 100
+        if 2 < chg_5d < 8:
+            trend_s = min(trend_s + 5, 30)
+            details["5日涨幅"] = f"+{chg_5d:.1f}%"
+        elif chg_5d > 8:
+            trend_s = max(trend_s - 3, 0)  # 短期涨太多扣分
+            details["5日涨幅"] = f"+{chg_5d:.1f}%(偏高)"
+    score += trend_s
+
+    # === 2. 动量信号 (0-25) ===
+    momentum_s = 0
+    # MACD
+    if latest["DIF"] > latest["DEA"] and prev["DIF"] <= prev["DEA"]:
+        momentum_s += 12; details["MACD"] = "金叉"
+        reasons.append("MACD金叉")
+    elif latest["DIF"] > latest["DEA"] and latest["MACD柱"] > prev["MACD柱"]:
+        momentum_s += 8; details["MACD"] = "红柱放大"
+    elif latest["DIF"] > latest["DEA"]:
+        momentum_s += 5; details["MACD"] = "多头"
+    elif (latest["DIF"] - latest["DEA"]) > (prev["DIF"] - prev["DEA"]):
+        momentum_s += 3; details["MACD"] = "即将金叉"
+    else:
+        details["MACD"] = "空头"
+
+    # KDJ
+    if latest["K"] > latest["D"] and latest["K"] < 80:
+        momentum_s += 6; details["KDJ"] = f"多头(K={latest['K']:.0f})"
+    elif latest["J"] < 20:
+        momentum_s += 8; details["KDJ"] = f"超卖(J={latest['J']:.0f})"
+        reasons.append("KDJ超卖")
+    elif latest["K"] > 80:
+        momentum_s += 1; details["KDJ"] = "超买注意"
+    else:
+        details["KDJ"] = f"K={latest['K']:.0f}"
+
+    # RSI
+    rsi = latest.get("RSI6", 50)
+    if not pd.isna(rsi):
+        if 40 <= rsi <= 65:
+            momentum_s += 7; details["RSI"] = f"{rsi:.0f}(健康)"
+        elif 30 <= rsi < 40:
+            momentum_s += 5; details["RSI"] = f"{rsi:.0f}(偏低)"
+        elif rsi < 30:
+            momentum_s += 4; details["RSI"] = f"{rsi:.0f}(超卖)"
+            reasons.append(f"RSI超卖{rsi:.0f}")
+        elif 65 < rsi <= 75:
+            momentum_s += 3; details["RSI"] = f"{rsi:.0f}(偏强)"
+        else:
+            momentum_s += 0; details["RSI"] = f"{rsi:.0f}(超买)"
+    score += min(momentum_s, 25)
+
+    # === 3. 量价配合 (0-20) ===
+    vol_s = 0
+    vr = latest.get("量比计算", 1.0)
+    chg = latest.get("涨跌幅", 0)
+    if not pd.isna(vr):
+        if 1.5 <= vr <= 4.0 and chg > 1:
+            vol_s = 20; details["量价"] = f"放量上涨(量比{vr:.1f})"
+            reasons.append("放量上涨")
+        elif 1.2 <= vr <= 5.0 and chg > 0:
+            vol_s = 15; details["量价"] = f"量升价涨(量比{vr:.1f})"
+        elif 0.8 <= vr < 1.5 and chg > 0:
+            vol_s = 10; details["量价"] = f"温和上涨(量比{vr:.1f})"
+        elif vr < 0.6:
+            vol_s = 3; details["量价"] = f"缩量(量比{vr:.1f})"
+        elif chg < -1 and vr > 1.5:
+            vol_s = 2; details["量价"] = f"放量下跌(量比{vr:.1f})"
+        else:
+            vol_s = 5; details["量价"] = f"量比{vr:.1f}"
+    score += vol_s
+
+    # === 4. 波段位置 (0-15) ===
+    pos_s = 0
+    boll_lower = latest.get("BOLL下", 0)
+    boll_mid = latest.get("BOLL中", 0)
+    boll_upper = latest.get("BOLL上", 0)
+    if boll_mid > 0:
+        if boll_lower > 0 and price <= boll_lower * 1.02:
+            pos_s = 15; details["位置"] = "布林下轨(超跌)"
+            reasons.append("触及布林下轨")
+        elif price < boll_mid and price > boll_lower:
+            pos_s = 12; details["位置"] = "布林中下轨(偏低)"
+        elif price > boll_mid and price < boll_upper * 0.98:
+            pos_s = 8; details["位置"] = "布林中上轨"
+        elif price >= boll_upper * 0.98:
+            pos_s = 2; details["位置"] = "布林上轨(偏高)"
+        else:
+            pos_s = 6; details["位置"] = "布林中轨附近"
+    # 回调买入：从高点回落3-8%是好位置
+    if len(df) >= 10:
+        high_10 = df.tail(10)["最高"].max()
+        pullback = (high_10 - price) / high_10 * 100
+        if 3 <= pullback <= 8 and trend_s >= 15:
+            pos_s = min(pos_s + 5, 15)
+            details["回调"] = f"从高点回调{pullback:.1f}%"
+            reasons.append(f"回调{pullback:.1f}%")
+    score += pos_s
+
+    # === 5. 波动率 (0-10) ===
+    atr = df.tail(20)["振幅"].mean() if len(df) >= 20 else 3.0
+    if 1.5 <= atr <= 4.0:
+        score += 10; details["波动"] = f"ATR {atr:.1f}%(适中)"
+    elif 1.0 <= atr < 1.5:
+        score += 6; details["波动"] = f"ATR {atr:.1f}%(偏低)"
+    elif 4.0 < atr <= 6.0:
+        score += 5; details["波动"] = f"ATR {atr:.1f}%(偏高)"
+    else:
+        score += 2; details["波动"] = f"ATR {atr:.1f}%"
+
+    reason_str = "；".join(reasons) if reasons else "信号不足"
+    return score, details, reason_str
+
+
+def calc_etf_risk(score, price, kline, holding_days=3):
+    """
+    ETF波段风控：止损止盈 + 仓位
+    持有1-5天，比T+1宽松
+    """
+    recent_20 = kline.tail(20)
+    atr = recent_20["振幅"].mean()
+    recent_5 = kline.tail(5)
+
+    # 止损：比T+1宽，给波段空间
+    if atr > 4:
+        stop_pct = -3.0
+    elif atr > 2.5:
+        stop_pct = -4.0
+    else:
+        stop_pct = -5.0
+
+    # 止盈：根据ATR和持有天数
+    tp1_pct = max(3.0, atr * 0.8)
+    tp2_pct = max(5.0, atr * 1.5)
+    tp3_pct = max(8.0, atr * 2.5)
+
+    # 仓位
+    if score >= 80:
+        position = 50
+    elif score >= 65:
+        position = 40
+    elif score >= 50:
+        position = 30
+    else:
+        position = 20
+
+    return {
+        "仓位": position,
+        "止损价": round(price * (1 + stop_pct / 100), 3),
+        "止损幅度": stop_pct,
+        "止盈一": round(price * (1 + tp1_pct / 100), 3),
+        "止盈一幅度": tp1_pct,
+        "止盈二": round(price * (1 + tp2_pct / 100), 3),
+        "止盈二幅度": tp2_pct,
+        "止盈三": round(price * (1 + tp3_pct / 100), 3),
+        "止盈三幅度": tp3_pct,
+        "ATR": atr,
+        "支撑位": recent_5["最低"].min(),
+        "压力位": recent_5["最高"].max(),
+        "建议持有": f"{holding_days}天",
+        "风险等级": "低风险" if atr < 2.5 else "中等风险" if atr < 4 else "较高风险",
+    }
+
+
+def scan_etf(top_n=10):
+    """扫描场内ETF，筛选波段机会"""
+    print("=" * 65)
+    print("  ETF 波段扫描（持有1-5天）")
+    print(f"  扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 65)
+    print()
+
+    # 市场环境
+    print("[1/4] 检测市场环境...")
+    sentiment_score, sentiment_info = get_sentiment_score()
+    print(f"  {sentiment_info}")
+    money_effect = calc_money_effect()
+    up_ratio = money_effect["今日上涨比例"]
+    print(f"  赚钱效应: {up_ratio:.0%}")
+
+    # 板块资金
+    print("[2/4] 获取板块资金流向...")
+    concept_flow = fetch_sector_flow("concept", top_n=10)
+    industry_flow = fetch_sector_flow("industry", top_n=10)
+    hot_concepts = [s["板块名称"] for s in concept_flow if s.get("主力净流入", 0) > 0][:5]
+    hot_industries = [s["板块名称"] for s in industry_flow if s.get("主力净流入", 0) > 0][:5]
+    if hot_concepts:
+        print(f"  热门概念: {', '.join(hot_concepts)}")
+    if hot_industries:
+        print(f"  热门行业: {', '.join(hot_industries)}")
+
+    # ETF列表
+    print("[3/4] 获取ETF列表...")
+    etf_list = fetch_etf_list()
+    if etf_list.empty:
+        print("[错误] 无法获取ETF列表")
+        return
+    print(f"  共 {len(etf_list)} 只活跃ETF")
+
+    # 逐只分析
+    print(f"[4/4] 分析ETF趋势...")
+    results = []
+    code_to_row = etf_list.set_index("代码").to_dict("index")
+
+    def analyze_etf(code):
+        kline = fetch_kline(code, days=120)
+        if kline.empty or len(kline) < 30:
+            return None
+        kline = calc_all_indicators(kline)
+        s, d, r = evaluate_etf_trend(kline)
+
+        # 板块热度加分
+        row = code_to_row.get(code, {})
+        name = str(row.get("名称", ""))
+        theme = row.get("主题", get_etf_theme(name))
+        theme_bonus = 0
+        # 检查ETF主题是否在热门板块中
+        for hot in hot_concepts + hot_industries:
+            if theme in hot or hot in name:
+                theme_bonus = 8
+                break
+        total = s + theme_bonus + min(sentiment_score, 10)
+
+        if total >= 45:
+            return {
+                "代码": code, "名称": name, "主题": theme,
+                "最新价": row.get("最新价", 0), "涨跌幅": row.get("涨跌幅", 0),
+                "成交额": row.get("成交额", 0), "换手率": row.get("换手率", 0),
+                "评分": total, "趋势分": s, "板块加分": theme_bonus,
+                "信号": d, "理由": r, "kline": kline,
+            }
+        return None
+
+    done = 0
+    total = len(etf_list)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyze_etf, c): c for c in etf_list["代码"].tolist()}
+        for future in as_completed(futures):
+            done += 1
+            if done % 50 == 0:
+                print(f"  进度: {done}/{total}")
+            try:
+                r = future.result()
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    if not results:
+        print("\n  今日未发现合适的ETF波段机会，建议观望。")
+        return
+
+    results.sort(key=lambda x: x["评分"], reverse=True)
+    results = results[:top_n]
+
+    print(f"\n  分析完成！{len(results)} 只候选")
+    print()
+    print("=" * 65)
+    print(f"  ETF 波段候选 TOP {len(results)}（满分120）")
+    print("=" * 65)
+    print()
+
+    table_data = []
+    for r in results:
+        vol_str = f"{r['成交额']/1e8:.1f}亿" if r["成交额"] >= 1e8 else f"{r['成交额']/1e4:.0f}万"
+        table_data.append([
+            r["代码"], r["名称"], r["主题"],
+            f"{r['最新价']:.3f}", f"{r['涨跌幅']:+.2f}%",
+            vol_str, r["评分"], r["理由"][:28],
+        ])
+    print(tabulate(
+        table_data,
+        headers=["代码", "名称", "主题", "现价", "涨跌幅", "成交额", "评分", "买入理由"],
+        tablefmt="simple_grid", stralign="center",
+    ))
+
+    # 详细信号
+    print()
+    print("── 详细信号 ──")
+    for r in results[:5]:
+        sigs = " | ".join([f"{k}:{v}" for k, v in r["信号"].items()])
+        print(f"  {r['代码']} {r['名称']}: {sigs}")
+
+    print()
+    print("提示：")
+    print("  - 评分>=80 强烈关注，>=60 可关注，>=45 谨慎")
+    print("  - ETF波段持有1-5天，止损-3%~-5%，止盈+5%~+10%")
+    print("  - 优先选成交额大、趋势明确的ETF")
+    print("  - 跟踪板块热度，热点退潮及时离场")
+
+
+def etf_go(top_n=3):
+    """ETF波段一键决策：推荐3只ETF + 波段操作计划"""
+    print()
+    print("=" * 65)
+    print("  ETF 波段决策系统")
+    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 65)
+
+    # 市场环境
+    print()
+    print("[1/5] 检测市场环境...")
+    sentiment_score, sentiment_info = get_sentiment_score()
+    money_effect = calc_money_effect()
+    nb_total, nb_info = fetch_northbound_flow()
+    limit_up, limit_down = count_limit_up()
+    print(f"  {sentiment_info}")
+    if nb_info:
+        print(f"  {nb_info}")
+    print(f"  涨停 {limit_up} 跌停 {limit_down}")
+
+    # 新闻
+    print()
+    print("[2/5] 扫描新闻热点...")
+    news = fetch_news()
+    news_score, hot_concepts, key_headlines = analyze_news_sentiment(news)
+    news_mood = "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空"
+    print(f"  新闻情绪: {news_mood}")
+    if hot_concepts:
+        print(f"  热点: {', '.join([c for c,_ in hot_concepts[:5]])}")
+
+    # 板块
+    print()
+    print("[3/5] 获取板块资金流向...")
+    concept_flow = fetch_sector_flow("concept", top_n=15)
+    industry_flow = fetch_sector_flow("industry", top_n=15)
+    hot_concepts_list = [s["板块名称"] for s in concept_flow if s.get("主力净流入", 0) > 0][:6]
+    hot_ind_list = [s["板块名称"] for s in industry_flow if s.get("主力净流入", 0) > 0][:6]
+    if hot_concepts_list:
+        print(f"  概念资金流入: {', '.join(hot_concepts_list)}")
+    if hot_ind_list:
+        print(f"  行业资金流入: {', '.join(hot_ind_list)}")
+    all_hot = hot_concepts_list + hot_ind_list
+
+    # ETF扫描
+    print()
+    print("[4/5] 获取ETF列表...")
+    etf_list = fetch_etf_list()
+    if etf_list.empty:
+        print("[错误] 无法获取ETF列表")
+        return
+    print(f"  {len(etf_list)} 只活跃ETF")
+
+    print()
+    print("[5/5] 分析ETF趋势...")
+    results = []
+    code_to_row = etf_list.set_index("代码").to_dict("index")
+
+    def analyze(code):
+        kline = fetch_kline(code, days=120)
+        if kline.empty or len(kline) < 30:
+            return None
+        kline = calc_all_indicators(kline)
+        s, d, r = evaluate_etf_trend(kline)
+        row = code_to_row.get(code, {})
+        name = str(row.get("名称", ""))
+        theme = row.get("主题", get_etf_theme(name))
+        theme_bonus = 0
+        for hot in all_hot:
+            if theme in hot or hot in name:
+                theme_bonus = 8
+                break
+        # 新闻热点加分
+        news_bonus = 0
+        for concept, pts in (hot_concepts or [])[:5]:
+            if concept in name or concept in theme:
+                news_bonus = min(pts // 3, 5)
+                break
+        total = s + theme_bonus + news_bonus + min(sentiment_score, 10)
+        if total >= 45:
+            price = float(kline.iloc[-1]["收盘"])
+            risk = calc_etf_risk(total, price, kline)
+            return {
+                "代码": code, "名称": name, "主题": theme,
+                "最新价": row.get("最新价", 0), "涨跌幅": row.get("涨跌幅", 0),
+                "成交额": row.get("成交额", 0),
+                "评分": total, "趋势分": s,
+                "板块加分": theme_bonus, "新闻加分": news_bonus,
+                "信号": d, "理由": r, "risk": risk,
+            }
+        return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyze, c): c for c in etf_list["代码"].tolist()}
+        for f in as_completed(futures):
+            try:
+                r = f.result()
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    if not results:
+        print("\n  今日无合适ETF，建议观望。")
+        return
+
+    results.sort(key=lambda x: x["评分"], reverse=True)
+
+    # 选3只，优先不同主题
+    selected = [results[0]]
+    used_themes = {results[0]["主题"]}
+    for r in results[1:]:
+        if len(selected) >= top_n:
+            break
+        if r["主题"] not in used_themes:
+            selected.append(r)
+            used_themes.add(r["主题"])
+    for r in results[1:]:
+        if len(selected) >= top_n:
+            break
+        if r not in selected:
+            selected.append(r)
+
+    print()
+    print("=" * 65)
+    print("  ★★★ ETF 波段操作建议（持有1-5天）★★★")
+    print("=" * 65)
+
+    for i, etf in enumerate(selected):
+        rk = etf["risk"]
+        print()
+        print(f"  ━━━ 第{i+1}只: {etf['名称']}({etf['代码']}) ━━━")
+        print()
+        print(f"  现价: {etf['最新价']:.3f}   今日: {etf['涨跌幅']:+.2f}%   主题: {etf['主题']}")
+        vol = f"{etf['成交额']/1e8:.1f}亿" if etf['成交额'] >= 1e8 else f"{etf['成交额']/1e4:.0f}万"
+        print(f"  成交额: {vol}")
+        print(f"  评分: {etf['评分']}/120 (趋势{etf['趋势分']}分"
+              + (f" +板块{etf['板块加分']}" if etf['板块加分'] else "")
+              + (f" +新闻{etf['新闻加分']}" if etf['新闻加分'] else "") + ")")
+        print(f"  买入理由: {etf['理由']}")
+        print()
+
+        # 信号详情
+        sigs = " | ".join([f"{k}:{v}" for k, v in etf["信号"].items()])
+        print(f"  信号: {sigs}")
+        print()
+
+        print(f"  ── 波段风控 ──")
+        print(f"  风险等级: {rk['风险等级']}  |  ATR: {rk['ATR']:.1f}%  |  建议持有: {rk['建议持有']}")
+        print()
+        print(f"  ── 买入计划 ──")
+        print(f"  买入价:   {etf['最新价']:.3f}")
+        print(f"  建议仓位: 总资金的 {rk['仓位']}%")
+        print()
+        print(f"  ── 持仓期间操作 ──")
+        print(f"  止损价:   {rk['止损价']:.3f} ({rk['止损幅度']:+.1f}%，跌破必须卖)")
+        print(f"  目标一:   {rk['止盈一']:.3f} (+{rk['止盈一幅度']:.1f}%，卖出1/3)")
+        print(f"  目标二:   {rk['止盈二']:.3f} (+{rk['止盈二幅度']:.1f}%，再卖1/3)")
+        print(f"  目标三:   {rk['止盈三']:.3f} (+{rk['止盈三幅度']:.1f}%，清仓)")
+        print(f"  支撑位:   {rk['支撑位']:.3f}")
+        print(f"  压力位:   {rk['压力位']:.3f}")
+        print()
+        print(f"  ── 每日检查清单 ──")
+        print(f"  Day 1: 买入后设好止损{rk['止损价']:.3f}，观察趋势是否延续")
+        print(f"  Day 2: 涨到目标一{rk['止盈一']:.3f}卖1/3，移动止损到成本价")
+        print(f"  Day 3: 继续持有或到目标二{rk['止盈二']:.3f}再卖1/3")
+        print(f"  Day 4-5: 趋势减弱或到期 → 清仓，不恋战")
+
+    # 综合
+    print()
+    print("=" * 65)
+    print("  ── 综合研判 ──")
+    print()
+    print(f"  大盘: {sentiment_info}")
+    print(f"  新闻面: {news_mood}")
+    if all_hot:
+        print(f"  资金流入: {', '.join(all_hot[:6])}")
+    if nb_info:
+        print(f"  北向: {nb_info}")
+    print()
+    print("  风险提示:")
+    print("  - ETF波段持有1-5天，不同于T+1当天进出")
+    print("  - 严格止损，跌破止损价必须卖")
+    print("  - 板块热度退潮时及时离场，不要死扛")
+    print("  - 以上仅为技术分析，不构成投资建议")
+    print("=" * 65)
+    print()
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -3206,6 +3810,10 @@ if __name__ == "__main__":
         show_market_sentiment()
     elif args[0] == "--sector":
         show_sector_flow()
+    elif args[0] == "--etf":
+        scan_etf()
+    elif args[0] == "--etf-go":
+        etf_go()
     elif args[0] == "--top":
         top_n = int(args[1]) if len(args) > 1 else 15
         scan_market_v2(top_n)

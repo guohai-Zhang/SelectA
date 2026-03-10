@@ -198,6 +198,19 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div id="go-results"></div>
 </div>
 
+<!-- ETF -->
+<div id="p-etf" class="page">
+  <div style="padding-top:28vh;text-align:center" id="etf-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">扫描场内ETF，筛选波段机会（持有1-5天）</div>
+    <button class="btn btn-primary" id="btn-etf" onclick="startEtf()" style="max-width:280px;margin:0 auto;font-size:17px;padding:16px;border-radius:14px">ETF 波段扫描</button>
+  </div>
+  <div id="etf-progress" style="display:none">
+    <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="etf-msg">准备中...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="etf-bar"></div></div>
+  </div>
+  <div id="etf-results"></div>
+</div>
+
 <!-- 板块 -->
 <div id="p-sector" class="page">
   <div class="sector-toggle">
@@ -222,6 +235,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div class="tab active" onclick="switchTab('market',this)"><span class="icon">&#127968;</span>首页</div>
   <div class="tab" onclick="switchTab('scan',this)"><span class="icon">&#128202;</span>扫描</div>
   <div class="tab" onclick="switchTab('go',this)"><span class="icon">&#127919;</span>决策</div>
+  <div class="tab" onclick="switchTab('etf',this)"><span class="icon">&#128176;</span>ETF</div>
   <div class="tab" onclick="switchTab('sector',this)"><span class="icon">&#128200;</span>板块</div>
   <div class="tab" onclick="switchTab('stock',this)"><span class="icon">&#128269;</span>个股</div>
 </div>
@@ -255,7 +269,7 @@ function switchTab(name, el) {
   $$('.tab').forEach(t => t.classList.remove('active'));
   $(`#p-${name}`).classList.add('active');
   if (el) el.classList.add('active');
-  else $$('.tab')[['market','scan','go','sector','stock'].indexOf(name)].classList.add('active');
+  else $$('.tab')[['market','scan','go','etf','sector','stock'].indexOf(name)].classList.add('active');
   currentTab = name;
   localStorage.setItem('tab', name);
   if (name === 'market' && !marketLoaded) loadMarket();
@@ -483,6 +497,116 @@ function renderGoResults(data) {
   </div>`;
 
   $('#go-results').innerHTML = html;
+}
+
+// ── ETF 波段 ──
+function startEtf() {
+  $('#btn-etf').disabled = true;
+  $('#etf-btn-wrap').style.paddingTop = '16px';
+  $('#etf-progress').style.display = 'block';
+  $('#etf-results').innerHTML = '';
+  const es = new EventSource('/api/etf');
+  es.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'progress') {
+      $('#etf-msg').textContent = d.msg;
+      $('#etf-bar').style.width = (d.pct || 0) + '%';
+    } else if (d.type === 'error') {
+      toast(d.msg); es.close(); $('#btn-etf').disabled = false;
+    } else if (d.type === 'result') {
+      es.close(); $('#btn-etf').disabled = false;
+      $('#etf-progress').style.display = 'none';
+      renderEtfResults(d.data);
+    }
+  };
+  es.onerror = () => { es.close(); $('#btn-etf').disabled = false; toast('连接断开'); };
+}
+
+function renderEtfResults(data) {
+  const sel = data.selected || [];
+  const all = data.all_candidates || [];
+  const mi = data.market_info || {};
+  if (!sel.length) {
+    $('#etf-results').innerHTML = '<div class="card" style="text-align:center;padding:30px;color:var(--text2)">今日无合适ETF波段机会，建议观望</div>';
+    return;
+  }
+  let html = '';
+
+  // 推荐ETF
+  sel.forEach((s, i) => {
+    const rk = s.risk || {};
+    const c = chgClass(s['涨跌幅']);
+    const vol = (s['成交额']||0) >= 1e8 ? ((s['成交额']/1e8).toFixed(1)+'亿') : ((s['成交额']/1e4).toFixed(0)+'万');
+    html += `<div class="go-stock">
+      <div class="go-stock-header">
+        <div>
+          <div class="go-stock-name">第${i+1}只: ${s['名称']}</div>
+          <div style="font-size:12px;color:var(--text2)">${s['代码']} | ${s['主题']} | ${vol}</div>
+        </div>
+        <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/120</span></div>
+      </div>
+      <div style="font-size:13px" class="${c}">现价 ${(s['最新价']||0).toFixed(3)} (${chgStr(s['涨跌幅']||0)})</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px">
+        趋势${s['趋势分']||0}分${s['板块加分']?' +板块'+s['板块加分']:''}${s['新闻加分']?' +新闻'+s['新闻加分']:''}
+      </div>
+      <div style="font-size:12px;margin-top:4px;color:var(--gold)">买入理由: ${s['理由']||''}</div>`;
+
+    // 信号标签
+    if (s['信号']) {
+      html += '<div style="margin-top:6px">';
+      Object.entries(s['信号']).forEach(([k,v]) => {
+        const cls = (v && v!=='-' && !v.includes('偏弱') && !v.includes('空头') && !v.includes('超买')) ? 'hot' : '';
+        html += `<span class="tag ${cls}">${k}:${v}</span>`;
+      });
+      html += '</div>';
+    }
+
+    // 风控
+    html += `<div class="go-section">
+        <div class="go-section-title">波段风控 (${rk['风险等级']||''} | ATR ${(rk.ATR||0).toFixed(1)}% | 持有${rk['建议持有']||'3天'})</div>
+        <div class="risk-row"><span class="risk-label">建议仓位</span><span class="risk-val">${rk['仓位']||0}%</span></div>
+        <div class="risk-row"><span class="risk-label">止损</span><span class="risk-val down">${(rk['止损价']||0).toFixed(3)} (${(rk['止损幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标一 (卖1/3)</span><span class="risk-val up">${(rk['止盈一']||0).toFixed(3)} (+${(rk['止盈一幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标二 (再卖1/3)</span><span class="risk-val up">${(rk['止盈二']||0).toFixed(3)} (+${(rk['止盈二幅度']||0).toFixed(1)}%)</span></div>
+        <div class="risk-row"><span class="risk-label">目标三 (清仓)</span><span class="risk-val up">${(rk['止盈三']||0).toFixed(3)} (+${(rk['止盈三幅度']||0).toFixed(1)}%)</span></div>
+      </div>
+
+      <div class="go-section">
+        <div class="go-section-title">每日检查清单</div>
+        <div class="timeline">
+          <div class="timeline-item">Day 1: 买入后设好止损${(rk['止损价']||0).toFixed(3)}，观察趋势</div>
+          <div class="timeline-item">Day 2: 涨到目标一卖1/3，移动止损到成本价</div>
+          <div class="timeline-item">Day 3: 继续持有或到目标二再卖1/3</div>
+          <div class="timeline-item" style="color:var(--red);font-weight:600">Day 4-5: 趋势减弱或到期→清仓，不恋战</div>
+        </div>
+      </div>
+    </div>`;
+  });
+
+  // 更多候选
+  if (all.length > sel.length) {
+    html += '<div class="card"><div class="card-title">更多候选</div>';
+    all.slice(sel.length).forEach(s => {
+      const c = chgClass(s['涨跌幅']);
+      html += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+        <span>${s['名称']} <span style="color:var(--text2)">${s['主题']}</span></span>
+        <span class="${c}" style="font-weight:600">${chgStr(s['涨跌幅']||0)} | ${s['评分']}分</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // 风险提示
+  html += `<div class="card" style="border-color:var(--red)">
+    <div style="font-size:12px;color:var(--text2);line-height:1.7">
+      <div style="color:var(--red);font-weight:600;margin-bottom:4px">风险提示</div>
+      - ETF波段持有1-5天，严格止损-3%~-5%<br>
+      - 板块热度退潮时及时离场<br>
+      - 以上仅为技术分析，不构成投资建议
+    </div>
+  </div>`;
+
+  $('#etf-results').innerHTML = html;
 }
 
 // ── 板块 ──

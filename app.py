@@ -552,6 +552,121 @@ def api_go():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── API: ETF 波段扫描 (SSE) ──
+
+@app.get("/api/etf")
+def api_etf():
+    def generate():
+        try:
+            yield sse({"type": "progress", "msg": "检测市场环境...", "pct": 5})
+            sentiment_score, sentiment_info = t1.get_sentiment_score()
+            money_effect = t1.calc_money_effect()
+
+            yield sse({"type": "progress", "msg": "获取板块资金流向...", "pct": 15})
+            concept_flow = t1.fetch_sector_flow("concept", top_n=15)
+            industry_flow = t1.fetch_sector_flow("industry", top_n=15)
+            hot_concepts_list = [s["板块名称"] for s in concept_flow if s.get("主力净流入", 0) > 0][:6]
+            hot_ind_list = [s["板块名称"] for s in industry_flow if s.get("主力净流入", 0) > 0][:6]
+            all_hot = hot_concepts_list + hot_ind_list
+
+            yield sse({"type": "progress", "msg": "获取ETF列表...", "pct": 25})
+            etf_list = t1.fetch_etf_list()
+            if etf_list.empty:
+                yield sse({"type": "error", "msg": "无法获取ETF列表"})
+                return
+
+            yield sse({"type": "progress", "msg": f"分析 {len(etf_list)} 只ETF...", "pct": 35})
+            results = []
+            code_to_row = etf_list.set_index("代码").to_dict("index")
+            total = len(etf_list)
+            done = [0]
+
+            # 新闻热点
+            news = t1.fetch_news()
+            news_score, hot_concepts, _ = t1.analyze_news_sentiment(news)
+
+            def analyze(code):
+                kl = t1.fetch_kline(code, days=120)
+                if kl.empty or len(kl) < 30:
+                    return None
+                kl = t1.calc_all_indicators(kl)
+                s, d, r = t1.evaluate_etf_trend(kl)
+                row = code_to_row.get(code, {})
+                name = str(row.get("名称", ""))
+                theme = row.get("主题", t1.get_etf_theme(name))
+                theme_bonus = 0
+                for hot in all_hot:
+                    if theme in hot or hot in name:
+                        theme_bonus = 8
+                        break
+                news_bonus = 0
+                for concept, pts in (hot_concepts or [])[:5]:
+                    if concept in name or concept in theme:
+                        news_bonus = min(pts // 3, 5)
+                        break
+                total_score = s + theme_bonus + news_bonus + min(sentiment_score, 10)
+                if total_score >= 45:
+                    price = float(kl.iloc[-1]["收盘"])
+                    risk = t1.calc_etf_risk(total_score, price, kl)
+                    return {
+                        "代码": code, "名称": name, "主题": theme,
+                        "最新价": row.get("最新价", 0), "涨跌幅": row.get("涨跌幅", 0),
+                        "成交额": row.get("成交额", 0),
+                        "评分": total_score, "趋势分": s,
+                        "板块加分": theme_bonus, "新闻加分": news_bonus,
+                        "信号": d, "理由": r, "risk": risk,
+                    }
+                return None
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(analyze, c): c for c in etf_list["代码"].tolist()}
+                for f in as_completed(futures):
+                    done[0] += 1
+                    try:
+                        r = f.result()
+                        if r:
+                            results.append(r)
+                    except Exception:
+                        pass
+                    if done[0] % 30 == 0:
+                        pct = 35 + int(done[0] / total * 55)
+                        yield sse({"type": "progress",
+                                   "msg": f"进度 {done[0]}/{total}，候选 {len(results)} 只",
+                                   "pct": min(pct, 92)})
+
+            results.sort(key=lambda x: x["评分"], reverse=True)
+
+            # 选3只，优先不同主题
+            selected = [results[0]] if results else []
+            used = {results[0]["主题"]} if results else set()
+            for r in results[1:]:
+                if len(selected) >= 3:
+                    break
+                if r["主题"] not in used:
+                    selected.append(r)
+                    used.add(r["主题"])
+            for r in results[1:]:
+                if len(selected) >= 3:
+                    break
+                if r not in selected:
+                    selected.append(r)
+
+            yield sse({"type": "result", "data": {
+                "selected": selected,
+                "all_candidates": results[:10],
+                "market_info": {
+                    "sentiment": {"score": sentiment_score, "info": sentiment_info},
+                    "hot_sectors": all_hot[:6],
+                    "money_effect": money_effect,
+                },
+            }})
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 # ── 启动入口 ──
 
 if __name__ == "__main__":

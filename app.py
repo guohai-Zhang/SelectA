@@ -21,14 +21,19 @@ _cache = {}
 _cache_ttl = {}
 
 def cached_call(key, func, ttl=120, *args, **kwargs):
-    """缓存函数调用结果，ttl秒后过期"""
+    """缓存函数调用结果，ttl秒后过期。异常时返回旧缓存（如有）"""
     now = time.time()
     if key in _cache and now - _cache_ttl.get(key, 0) < ttl:
         return _cache[key]
-    result = func(*args, **kwargs)
-    _cache[key] = result
-    _cache_ttl[key] = now
-    return result
+    try:
+        result = func(*args, **kwargs)
+        _cache[key] = result
+        _cache_ttl[key] = now
+        return result
+    except Exception:
+        if key in _cache:
+            return _cache[key]  # 返回过期缓存，优于报错
+        raise
 
 
 app = FastAPI(title="A股 T+1 短线分析")
@@ -305,11 +310,7 @@ def api_scan(top: int = Query(15, ge=1, le=50)):
             fund_batch = t1.fetch_fundamentals_batch()
 
             # 预筛选
-            stock_list = stock_list[
-                (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
-                (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 9.8) &
-                (stock_list["换手率"] >= 2) & (stock_list["量比"] >= 0.8)
-            ]
+            stock_list = t1._prefilter(stock_list, t1.PREFILTER_SCAN)
             capital_codes = set(capital_rank.keys())
             priority = stock_list[stock_list["代码"].isin(capital_codes)]["代码"].tolist()
             others = stock_list[~stock_list["代码"].isin(capital_codes)]["代码"].tolist()
@@ -468,11 +469,7 @@ def api_go():
                 return
 
             # 预筛选
-            stock_list = stock_list[
-                (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 80) &
-                (stock_list["涨跌幅"] > -3) & (stock_list["涨跌幅"] < 8) &
-                (stock_list["换手率"] >= 2) & (stock_list["量比"] >= 0.8)
-            ]
+            stock_list = t1._prefilter(stock_list, t1.PREFILTER_GO)
             capital_codes = set(capital_rank.keys())
             bb_codes = set(billboard_data.keys())
             p1 = stock_list[stock_list["代码"].isin(bb_codes & capital_codes)]["代码"].tolist()
@@ -726,7 +723,7 @@ def api_go5():
             market_regime, regime_adj, regime_label = t1.calc_market_regime()
             calendar_adj, calendar_label = t1.calc_calendar_adjustment()
 
-            yield sse({"type": "progress", "msg": "扫描新闻+板块...", "pct": 8})
+            yield sse({"type": "progress", "msg": "扫描新闻+板块+风险数据...", "pct": 8})
             news = t1.fetch_news()
             global_news = t1.fetch_global_news()
             all_news = news + global_news
@@ -740,6 +737,11 @@ def api_go5():
             limit_up_pool = t1.fetch_limit_up_pool()
             shareholder_data = t1.fetch_shareholder_increase()
             industry_data = t1.fetch_industry_prosperity()
+            # ★ T+5 也获取多维度风险数据
+            commodity_data = cached_call("commodity", t1.fetch_commodity_prices, 300)
+            global_markets = cached_call("global_markets", t1.fetch_global_markets, 300)
+            global_penalty, global_warn, _ = t1.calc_global_risk(global_markets)
+            ah_data = cached_call("ah_premium", t1.fetch_ah_premium, 300)
 
             yield sse({"type": "progress", "msg": "获取股票列表+资金...", "pct": 20})
             capital_rank = t1.fetch_capital_flow_rank(top_n=300)
@@ -750,11 +752,7 @@ def api_go5():
                 return
 
             # T+5 宽筛选
-            stock_list = stock_list[
-                (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 100) &
-                (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 5) &
-                (stock_list["换手率"] >= 1.5) & (stock_list["量比"] >= 0.6)
-            ]
+            stock_list = t1._prefilter(stock_list, t1.PREFILTER_GO5)
             capital_codes = set(capital_rank.keys())
             bb_codes = set(billboard_data.keys())
             p1 = stock_list[stock_list["代码"].isin(capital_codes & bb_codes)]["代码"].tolist()
@@ -788,6 +786,13 @@ def api_go5():
                         return None
                     if any(vi in name for vi in veto_industries):
                         return None
+                # ★ 多维度风险检测（与T+1一致）
+                commodity_pen, commodity_warn = t1.check_commodity_risk(stock_ind, name, commodity_data)
+                rally_pen, rally_warn = t1.check_consecutive_rally(kl)
+                ah_pen, ah_warn = t1.check_ah_premium_risk(code, name, ah_data)
+                current_turnover = row.get("换手率", 0) or 0
+                turnover_adj_val, turnover_label = t1.analyze_turnover_depth(kl, current_turnover)
+                macro_adj_val, macro_label = t1.check_macro_trend_fit(stock_ind, name, trend_industries)
                 wt_adj, _ = t1.calc_weekly_trend(kl)
                 tc_adj, _ = t1.classify_trend_context(kl)
                 es, ed, er = t1.evaluate_extra_dimensions(
@@ -800,6 +805,13 @@ def api_go5():
                     trend_context_adj=tc_adj, calendar_adj=calendar_adj)
                 if not passed:
                     return None
+                # ★ 风险惩罚扣分
+                risk_penalty = commodity_pen + rally_pen + ah_pen + min(global_penalty, 0)
+                tech_sc += risk_penalty
+                # 合并风险警告
+                risk_warns = [w for w in [commodity_warn, rally_warn, ah_warn, global_warn, turnover_label, macro_label] if w]
+                if risk_warns:
+                    r = r + "；⚠" + "，".join(risk_warns) if r else "⚠" + "，".join(risk_warns)
                 has_combo = d.get("黄金组合匹配", False)
                 if has_combo and tech_sc >= t1.TECH_GATE_THRESHOLD + 15:
                     rec_level = "强推荐"

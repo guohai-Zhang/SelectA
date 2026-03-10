@@ -296,6 +296,31 @@ function toast(msg) {
   setTimeout(() => t.classList.remove('show'), 2500);
 }
 
+// SSE with auto-retry (max 2 retries)
+function sseConnect(url, onMessage, onDone) {
+  let retries = 0;
+  const maxRetries = 2;
+  function connect() {
+    const es = new EventSource(url);
+    es.onmessage = (e) => {
+      retries = 0; // reset on successful message
+      onMessage(JSON.parse(e.data), es);
+    };
+    es.onerror = () => {
+      es.close();
+      if (retries < maxRetries) {
+        retries++;
+        toast(`连接断开，第${retries}次重试...`);
+        setTimeout(connect, 1500 * retries);
+      } else {
+        toast('连接失败，请重试');
+        if (onDone) onDone();
+      }
+    };
+  }
+  connect();
+}
+
 // ── 标签切换 ──
 let currentTab = localStorage.getItem('tab') || 'market';
 function switchTab(name, el) {
@@ -402,9 +427,7 @@ function startScan() {
   $('#scan-btn-wrap').style.paddingTop = '16px';
   $('#scan-progress').style.display = 'block';
   $('#scan-results').innerHTML = '';
-  const es = new EventSource('/api/scan?top=15');
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
+  sseConnect('/api/scan?top=15', (d, es) => {
     if (d.type === 'progress') {
       $('#scan-msg').textContent = d.msg;
       $('#scan-bar').style.width = (d.pct || 0) + '%';
@@ -419,8 +442,7 @@ function startScan() {
       $('#scan-progress').style.display = 'none';
       renderScanResults(d);
     }
-  };
-  es.onerror = () => { es.close(); $('#btn-scan').disabled = false; toast('连接断开'); };
+  }, () => { $('#btn-scan').disabled = false; });
 }
 
 function renderScanResults(d) {
@@ -456,9 +478,7 @@ function startGo() {
   $('#go-btn-wrap').style.paddingTop = '16px';
   $('#go-progress').style.display = 'block';
   $('#go-results').innerHTML = '';
-  const es = new EventSource('/api/go');
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
+  sseConnect('/api/go', (d, es) => {
     if (d.type === 'progress') {
       $('#go-msg').textContent = d.msg;
       $('#go-bar').style.width = (d.pct || 0) + '%';
@@ -473,8 +493,7 @@ function startGo() {
       $('#go-progress').style.display = 'none';
       renderGoResults(d.data);
     }
-  };
-  es.onerror = () => { es.close(); $('#btn-go').disabled = false; toast('连接断开'); };
+  }, () => { $('#btn-go').disabled = false; });
 }
 
 function renderGoResults(data) {
@@ -502,7 +521,7 @@ function renderGoResults(data) {
 
   // 推荐股票
   sel.forEach((s, i) => {
-    const rk = s.risk || {};
+    const rk = (s.risk && Object.keys(s.risk).length) ? s.risk : null;
     const c = chgClass(s['涨跌幅']);
     const rl = s['推荐等级'] || '仅参考';
     const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : 'var(--text3)';
@@ -519,11 +538,11 @@ function renderGoResults(data) {
       <div style="font-size:13px" class="${c}">现价 ${(s['最新价']||0).toFixed(2)} (${chgStr(s['涨跌幅']||0)})</div>
       <div style="font-size:12px;color:var(--text2);margin-top:4px">
         技术${s['技术分']||0} | 基本面${s['基本面分']||0}/50 | 聪明钱${s['聪明钱分']||0}/80
-        ${s['新闻加分']>0?' | 新闻+'+s['新闻加分']+'['+s['匹配概念']+']':''}
+        ${s['新闻加分']>0?' | 新闻+'+s['新闻加分']+(s['匹配概念']?'['+s['匹配概念']+']':''):''}
       </div>
       <div style="font-size:12px;margin-top:4px;color:var(--gold)">买入理由: ${s['理由']||''}</div>
 
-      <div class="go-section">
+      ${rk ? `<div class="go-section">
         <div class="go-section-title">智能风控 (${rk['风险等级']||''} | ATR ${(rk.ATR||0).toFixed(1)}%)</div>
         <div class="risk-row"><span class="risk-label">建议仓位</span><span class="risk-val">${rk['仓位']||0}%</span></div>
         <div class="risk-row"><span class="risk-label">止损价</span><span class="risk-val down">${(rk['止损价']||0).toFixed(2)} (${(rk['止损幅度']||0).toFixed(1)}%)</span></div>
@@ -532,7 +551,6 @@ function renderGoResults(data) {
         <div class="risk-row"><span class="risk-label">目标三 (清仓)</span><span class="risk-val up">${(rk['止盈三']||0).toFixed(2)} (+${(rk['止盈三幅度']||0).toFixed(1)}%)</span></div>
         <div class="risk-row"><span class="risk-label">支撑/压力</span><span class="risk-val">${(rk['支撑位']||0).toFixed(2)} / ${(rk['压力位']||0).toFixed(2)}</span></div>
       </div>
-
       <div class="go-section">
         <div class="go-section-title">明日分时卖出节奏</div>
         <div class="timeline">
@@ -542,7 +560,7 @@ function renderGoResults(data) {
           <div class="timeline-item">13:00-14:30 没到目标且走弱则卖</div>
           <div class="timeline-item" style="color:var(--red);font-weight:600">14:30-15:00 无论盈亏必须清仓！</div>
         </div>
-      </div>
+      </div>` : `<div class="go-section" style="text-align:center;color:var(--red);padding:12px">风控数据加载失败，请重新分析</div>`}
     </div>`;
   });
 
@@ -591,9 +609,7 @@ function startGo5() {
   $('#go5-btn-wrap').style.paddingTop = '16px';
   $('#go5-progress').style.display = 'block';
   $('#go5-results').innerHTML = '';
-  const es = new EventSource('/api/go5');
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
+  sseConnect('/api/go5', (d, es) => {
     if (d.type === 'progress') {
       $('#go5-msg').textContent = d.msg;
       $('#go5-bar').style.width = (d.pct || 0) + '%';
@@ -604,8 +620,7 @@ function startGo5() {
       $('#go5-progress').style.display = 'none';
       renderGo5Results(d.data);
     }
-  };
-  es.onerror = () => { es.close(); $('#btn-go5').disabled = false; toast('连接断开'); };
+  }, () => { $('#btn-go5').disabled = false; });
 }
 
 function renderGo5Results(data) {
@@ -618,7 +633,7 @@ function renderGo5Results(data) {
   let html = '';
 
   sel.forEach((s, i) => {
-    const rk = s.risk || {};
+    const rk = (s.risk && Object.keys(s.risk).length) ? s.risk : null;
     const c = chgClass(s['涨跌幅']);
     const rl = s['推荐等级'] || '弱推荐';
     const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : 'var(--text2)';
@@ -639,7 +654,7 @@ function renderGo5Results(data) {
       </div>
       <div style="font-size:12px;margin-top:4px;color:var(--blue)">买入理由: ${s['理由']||''}</div>
 
-      <div class="go-section">
+      ${rk ? `<div class="go-section">
         <div class="go-section-title" style="border-color:var(--blue)">T+5 波段风控 (${rk['风险等级']||''} | ATR ${(rk.ATR||0).toFixed(1)}%)</div>
         <div class="risk-row"><span class="risk-label">建议仓位</span><span class="risk-val">${rk['仓位']||0}%</span></div>
         <div class="risk-row"><span class="risk-label">止损价</span><span class="risk-val down">${(rk['止损价']||0).toFixed(2)} (${(rk['止损幅度']||0).toFixed(1)}%)</span></div>
@@ -648,7 +663,6 @@ function renderGo5Results(data) {
         <div class="risk-row"><span class="risk-label">目标三 (清仓)</span><span class="risk-val up">${(rk['止盈三']||0).toFixed(2)} (+${(rk['止盈三幅度']||0).toFixed(1)}%)</span></div>
         <div class="risk-row"><span class="risk-label">移动止损</span><span class="risk-val" style="font-size:11px">${rk['移动止损']||''}</span></div>
       </div>
-
       <div class="go-section">
         <div class="go-section-title" style="border-color:var(--blue)">持仓5天操作计划</div>
         <div class="timeline">
@@ -658,7 +672,7 @@ function renderGo5Results(data) {
           <div class="timeline-item">Day 4: 达目标二 ${(rk['止盈二']||0).toFixed(2)} 再卖1/3</div>
           <div class="timeline-item" style="color:var(--blue);font-weight:600">Day 5: 收盘前无条件清仓！</div>
         </div>
-      </div>
+      </div>` : `<div class="go-section" style="text-align:center;color:var(--red);padding:12px">风控数据加载失败，请重新分析</div>`}
     </div>`;
   });
 
@@ -686,9 +700,7 @@ function startEtf() {
   $('#etf-btn-wrap').style.paddingTop = '16px';
   $('#etf-progress').style.display = 'block';
   $('#etf-results').innerHTML = '';
-  const es = new EventSource('/api/etf');
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
+  sseConnect('/api/etf', (d, es) => {
     if (d.type === 'progress') {
       $('#etf-msg').textContent = d.msg;
       $('#etf-bar').style.width = (d.pct || 0) + '%';
@@ -699,8 +711,7 @@ function startEtf() {
       $('#etf-progress').style.display = 'none';
       renderEtfResults(d.data);
     }
-  };
-  es.onerror = () => { es.close(); $('#btn-etf').disabled = false; toast('连接断开'); };
+  }, () => { $('#btn-etf').disabled = false; });
 }
 
 function renderEtfResults(data) {

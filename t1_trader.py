@@ -50,6 +50,20 @@ HEADERS = {
 UT = "b2884a393a59ad64002292a3e90d46a5"
 FS_ALL_A = "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2"
 
+# 预筛选参数（统一 scan / go / go5 使用）
+PREFILTER_SCAN = {"价格下限": 3, "价格上限": 100, "涨幅下限": -5, "涨幅上限": 9.8, "换手率下限": 2, "量比下限": 0.8}
+PREFILTER_GO = {"价格下限": 5, "价格上限": 80, "涨幅下限": -3, "涨幅上限": 8, "换手率下限": 2, "量比下限": 0.8}
+PREFILTER_GO5 = {"价格下限": 5, "价格上限": 100, "涨幅下限": -5, "涨幅上限": 5, "换手率下限": 1.5, "量比下限": 0.6}
+
+
+def _prefilter(stock_list, params):
+    """统一预筛选"""
+    return stock_list[
+        (stock_list["最新价"] >= params["价格下限"]) & (stock_list["最新价"] <= params["价格上限"]) &
+        (stock_list["涨跌幅"] > params["涨幅下限"]) & (stock_list["涨跌幅"] < params["涨幅上限"]) &
+        (stock_list["换手率"] >= params["换手率下限"]) & (stock_list["量比"] >= params["量比下限"])
+    ]
+
 
 def _mkt_prefix(code):
     """股票代码 -> 市场前缀 sz/sh"""
@@ -1036,7 +1050,9 @@ def calc_position_and_risk(stock_score, sentiment_score, northbound_total, limit
     """
     latest = kline.iloc[-1]
     recent_20 = kline.tail(20)
-    atr = recent_20["振幅"].mean()  # 平均振幅
+    atr = recent_20["振幅"].mean() if "振幅" in kline.columns else 3.0
+    if pd.isna(atr) or atr <= 0:
+        atr = 3.0  # 默认3%振幅
     recent_5 = kline.tail(5)
 
     # ★ 动态止损：基于ATR倍数（标准风控是1.5-2倍ATR）
@@ -2341,6 +2357,7 @@ DEFAULT_WEIGHTS = {
     "形态_阳包阴": 2, "形态_锤子线": 3, "形态_早晨之星": 3, "形态_阳线": 1,
     # 资金 — 互斥
     "资金_大幅流入": 30, "资金_明显流入": 24, "资金_温和流入": 18, "资金_小幅流入": 10,
+    "资金_流出": -10,
 }
 
 # 互斥组：同组内只取第一个触发的信号
@@ -2352,7 +2369,7 @@ SIGNAL_GROUPS = {
     "BOLL": ["BOLL_触及下轨", "BOLL_中轨下方"],
     "量价": ["量价_放量上涨", "量价_量升价涨", "量价_放量横盘", "量价_缩量上涨", "量价_严重缩量"],
     "形态": ["形态_阳包阴", "形态_锤子线", "形态_早晨之星", "形态_阳线"],
-    "资金": ["资金_大幅流入", "资金_明显流入", "资金_温和流入", "资金_小幅流入"],
+    "资金": ["资金_大幅流入", "资金_明显流入", "资金_温和流入", "资金_小幅流入", "资金_流出"],
 }
 
 
@@ -2367,8 +2384,7 @@ def apply_weights(signals, weights=None):
             if signals.get(sig):
                 w = weights.get(sig, 0)
                 score += w
-                if w > 0:
-                    fired_signals.append(sig)
+                fired_signals.append(sig)
                 break  # 互斥：只取第一个
     return score, fired_signals
 
@@ -2928,6 +2944,9 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
         score -= 8
         details["利空叠加"] = f"{bearish_count}项看空"
 
+    # ★ 总分上限280（避免各维度叠加超标）
+    score = min(score, 280)
+
     reason_str = "；".join(reasons) if reasons else "信号不足"
     return score, details, reason_str
 
@@ -3134,60 +3153,56 @@ def scan_market_v2(top_n=15):
         print(f"  市场环境正常 (赚钱效应:{money_effect['今日上涨比例']:.0%})")
     print()
 
-    print("[1/9] 获取市场情绪...")
-    sentiment_score, sentiment_info = get_sentiment_score()
-    print(f"  {sentiment_info} → 情绪分: {sentiment_score}/15")
+    print("[1/2] 并行获取情绪/板块/资金/龙虎榜/北向/融资/涨停/增持/行业/股票列表/基本面...")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        f_sentiment = ex.submit(get_sentiment_score)
+        f_hot = ex.submit(get_hot_sectors)
+        f_cap = ex.submit(fetch_capital_flow_rank, 200)
+        f_bb = ex.submit(fetch_billboard)
+        f_bb_detail = ex.submit(fetch_billboard_detail)
+        f_nb = ex.submit(fetch_northbound_flow)
+        f_margin = ex.submit(fetch_margin_data_top)
+        f_limit = ex.submit(count_limit_up)
+        f_zt = ex.submit(fetch_limit_up_pool)
+        f_sh = ex.submit(fetch_shareholder_increase)
+        f_ind = ex.submit(fetch_industry_prosperity)
+        f_sl = ex.submit(fetch_stock_list_sina)
+        f_fund = ex.submit(fetch_fundamentals_batch)
 
-    print("[2/9] 获取板块资金流向...")
-    hot_sectors = get_hot_sectors()
+    sentiment_score, sentiment_info = f_sentiment.result()
+    hot_sectors = f_hot.result()
+    capital_rank = f_cap.result()
+    billboard_data = f_bb.result()
+    billboard_detail = f_bb_detail.result()
+    northbound_total, northbound_info = f_nb.result()
+    margin_data = f_margin.result()
+    limit_up, limit_down = f_limit.result()
+    limit_up_pool = f_zt.result()
+    shareholder_data = f_sh.result()
+    industry_data = f_ind.result()
+    stock_list = f_sl.result()
+    fund_batch = f_fund.result()
+
+    print(f"  情绪: {sentiment_info} → {sentiment_score}/15")
     if hot_sectors:
         print(f"  热门板块: {', '.join(list(hot_sectors)[:8])}")
-
-    print("[3/9] 获取主力资金流向 TOP200...")
-    capital_rank = fetch_capital_flow_rank(top_n=200)
-    print(f"  获取到 {len(capital_rank)} 只股票的资金数据")
-
-    print("[4/9] 获取龙虎榜+席位...")
-    billboard_data = fetch_billboard()
-    billboard_detail = fetch_billboard_detail()
+    print(f"  资金TOP {len(capital_rank)} 只")
     bb_buy = sum(1 for v in billboard_data.values() if v["龙虎榜净买入"] > 0)
-    print(f"  龙虎榜 {len(billboard_data)} 只(净买入{bb_buy}只), 席位明细 {len(billboard_detail)} 只")
-
-    print("[5/9] 获取北向+融资+涨停...")
-    northbound_total, northbound_info = fetch_northbound_flow()
-    margin_data = fetch_margin_data_top()
-    limit_up, limit_down = count_limit_up()
-    limit_up_pool = fetch_limit_up_pool()
+    print(f"  龙虎榜 {len(billboard_data)} 只(净买入{bb_buy}), 席位 {len(billboard_detail)} 只")
     if northbound_info:
         print(f"  北向: {northbound_info}")
     print(f"  融资 {len(margin_data)} 只 | 涨停 {limit_up} 跌停 {limit_down} | 涨停池 {len(limit_up_pool)} 只")
-
-    print("[6/9] 获取股东增持...")
-    shareholder_data = fetch_shareholder_increase()
-    print(f"  近30日增持 {len(shareholder_data)} 只")
-
-    print("[7/9] 获取行业景气度...")
-    industry_data = fetch_industry_prosperity()
+    print(f"  增持 {len(shareholder_data)} 只")
     if industry_data:
         top3 = list(industry_data.items())[:3]
         print("  热门行业: " + ", ".join([f"{n}({d['涨跌幅']:+.1f}%)" for n, d in top3]))
-
-    print("[8/9] 获取股票列表...")
-    stock_list = fetch_stock_list_sina()
     if stock_list.empty:
         print("[错误] 无法获取股票列表")
         return
-
-    print("[9/9] 获取基本面数据...")
-    fund_batch = fetch_fundamentals_batch()
-    print(f"  获取 {len(fund_batch)} 只股票的基本面数据")
+    print(f"  基本面 {len(fund_batch)} 只 | 全市场 {len(stock_list)} 只")
 
     # 预筛选
-    stock_list = stock_list[
-        (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
-        (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 9.8) &
-        (stock_list["换手率"] >= 2) & (stock_list["量比"] >= 0.8)
-    ]
+    stock_list = _prefilter(stock_list, PREFILTER_SCAN)
 
     capital_codes = set(capital_rank.keys())
     priority_codes = stock_list[stock_list["代码"].isin(capital_codes)]["代码"].tolist()
@@ -4267,41 +4282,46 @@ def go_decision():
         for h in key_headlines[:5]:
             print(f"    {h}")
 
-    # ── Step 2: 大盘情绪 ──
+    # ── Step 2: 并行获取多维度数据 ──
     print()
-    print("[2/12] 分析大盘情绪...")
-    sentiment_score, sentiment_info = get_sentiment_score()
-    print(f"  {sentiment_info} → 情绪分: {sentiment_score}/15")
+    print("[2/4] 并行获取情绪/板块/龙虎榜/北向/融资/涨停/增持/行业/资金/基本面/股票列表...")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        f_sentiment = ex.submit(get_sentiment_score)
+        f_hot = ex.submit(get_hot_sectors)
+        f_bb = ex.submit(fetch_billboard)
+        f_bb_detail = ex.submit(fetch_billboard_detail)
+        f_nb = ex.submit(fetch_northbound_flow)
+        f_margin = ex.submit(fetch_margin_data_top)
+        f_limit = ex.submit(count_limit_up)
+        f_zt = ex.submit(fetch_limit_up_pool)
+        f_sh = ex.submit(fetch_shareholder_increase)
+        f_ind = ex.submit(fetch_industry_prosperity)
+        f_cap = ex.submit(fetch_capital_flow_rank, 300)
+        f_fund = ex.submit(fetch_fundamentals_batch)
+        f_sl = ex.submit(fetch_stock_list_sina)
 
-    # ── Step 3: 板块/龙虎榜/北向/融资/涨停 ──
-    print()
-    print("[3/9] 扫描板块资金流向...")
-    hot_sectors = get_hot_sectors()
+    sentiment_score, sentiment_info = f_sentiment.result()
+    hot_sectors = f_hot.result()
+    billboard_data = f_bb.result()
+    billboard_detail = f_bb_detail.result()
+    northbound_total, northbound_info = f_nb.result()
+    margin_data = f_margin.result()
+    limit_up, limit_down = f_limit.result()
+    limit_up_pool = f_zt.result()
+    shareholder_data = f_sh.result()
+    industry_data = f_ind.result()
+    capital_rank = f_cap.result()
+    fund_batch = f_fund.result()
+    stock_list = f_sl.result()
+
+    print(f"  情绪: {sentiment_info} → {sentiment_score}/15")
     if hot_sectors:
         print(f"  资金流入板块: {', '.join(list(hot_sectors)[:6])}")
-
-    print()
-    print("[4/9] 获取龙虎榜数据...")
-    billboard_data = fetch_billboard()
     bb_buy = sum(1 for v in billboard_data.values() if v["龙虎榜净买入"] > 0)
-    print(f"  龙虎榜 {len(billboard_data)} 只，净买入 {bb_buy} 只")
-
-    print()
-    print("[5/9] 获取北向资金...")
-    northbound_total, northbound_info = fetch_northbound_flow()
+    print(f"  龙虎榜 {len(billboard_data)} 只(净买入{bb_buy}) | 席位 {len(billboard_detail)} 只")
     if northbound_info:
-        print(f"  {northbound_info}")
-
-    print()
-    print("[6/9] 获取融资融券...")
-    margin_data = fetch_margin_data_top()
-    print(f"  融资数据 {len(margin_data)} 只")
-
-    print()
-    print("[7/12] 统计涨跌停+涨停池...")
-    limit_up, limit_down = count_limit_up()
-    limit_up_pool = fetch_limit_up_pool()
-    print(f"  涨停 {limit_up} 只，跌停 {limit_down} 只，涨停池 {len(limit_up_pool)} 只")
+        print(f"  北向: {northbound_info}")
+    print(f"  融资 {len(margin_data)} 只 | 涨停 {limit_up} 跌停 {limit_down} | 涨停池 {len(limit_up_pool)} 只")
     # 连板统计
     boards_count = {}
     for v in limit_up_pool.values():
@@ -4310,42 +4330,18 @@ def go_decision():
     if boards_count:
         board_info = " ".join([f"{b}板:{c}只" for b, c in sorted(boards_count.items())])
         print(f"  连板分布: {board_info}")
-
-    print()
-    print("[8/12] 获取龙虎榜席位明细...")
-    billboard_detail = fetch_billboard_detail()
-    inst_count = sum(1 for v in billboard_detail.values() if v.get("机构席位数", 0) > 0)
-    print(f"  席位明细 {len(billboard_detail)} 只，机构参与 {inst_count} 只")
-
-    print()
-    print("[9/12] 获取股东增持数据...")
-    shareholder_data = fetch_shareholder_increase()
-    print(f"  近30日增持 {len(shareholder_data)} 只")
-
-    print()
-    print("[10/12] 获取行业景气度...")
-    industry_data = fetch_industry_prosperity()
+    print(f"  增持 {len(shareholder_data)} 只")
     if industry_data:
         top3 = list(industry_data.items())[:3]
         print("  热门行业: " + ", ".join([f"{n}({d['涨跌幅']:+.1f}%)" for n, d in top3]))
 
-    # ── Step 11: 主力资金 + 基本面 + 股票列表 ──
-    print()
-    print("[11/12] 获取主力资金+基本面+股票列表...")
-    capital_rank = fetch_capital_flow_rank(top_n=300)
-    fund_batch = fetch_fundamentals_batch()
-    stock_list = fetch_stock_list_sina()
     if stock_list.empty:
         print("[错误] 无法获取股票列表")
         return
     print(f"  资金TOP {len(capital_rank)} | 基本面 {len(fund_batch)} | 全市场 {len(stock_list)}")
 
     # 预筛选
-    stock_list = stock_list[
-        (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 80) &
-        (stock_list["涨跌幅"] > -3) & (stock_list["涨跌幅"] < 8) &
-        (stock_list["换手率"] >= 2) & (stock_list["量比"] >= 0.8)
-    ]
+    stock_list = _prefilter(stock_list, PREFILTER_GO)
 
     capital_codes = set(capital_rank.keys())
     bb_codes = set(billboard_data.keys())
@@ -4756,36 +4752,52 @@ def go5_decision():
     news_mood = "偏多" if news_score > 3 else "中性偏多" if news_score > 0 else "中性偏空" if news_score > -3 else "偏空"
     print(f"  新闻情绪: {news_mood}")
 
-    # ── 板块/资金 ──
+    # ── 并行获取板块/资金/股票列表 ──
     print()
-    print("[3/8] 获取板块/龙虎榜/北向/融资...")
-    hot_sectors = get_hot_sectors()
-    billboard_data = fetch_billboard()
-    nb_total, nb_info = fetch_northbound_flow()
-    margin_data = fetch_margin_data_top()
-    limit_up, limit_down = count_limit_up()
-    limit_up_pool = fetch_limit_up_pool()
-    shareholder_data = fetch_shareholder_increase()
-    industry_data = fetch_industry_prosperity()
+    print("[3/4] 并行获取板块/龙虎榜/北向/融资/增持/行业/资金/基本面/股票列表...")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        f_hot = ex.submit(get_hot_sectors)
+        f_bb = ex.submit(fetch_billboard)
+        f_nb = ex.submit(fetch_northbound_flow)
+        f_margin = ex.submit(fetch_margin_data_top)
+        f_limit = ex.submit(count_limit_up)
+        f_zt = ex.submit(fetch_limit_up_pool)
+        f_sh = ex.submit(fetch_shareholder_increase)
+        f_ind = ex.submit(fetch_industry_prosperity)
+        f_cap = ex.submit(fetch_capital_flow_rank, 300)
+        f_fund = ex.submit(fetch_fundamentals_batch)
+        f_sl = ex.submit(fetch_stock_list_sina)
+        f_commodity = ex.submit(fetch_commodity_prices)
+        f_global = ex.submit(fetch_global_markets)
+        f_ah = ex.submit(fetch_ah_premium)
+
+    hot_sectors = f_hot.result()
+    billboard_data = f_bb.result()
+    nb_total, nb_info = f_nb.result()
+    margin_data = f_margin.result()
+    limit_up, limit_down = f_limit.result()
+    limit_up_pool = f_zt.result()
+    shareholder_data = f_sh.result()
+    industry_data = f_ind.result()
+    capital_rank = f_cap.result()
+    fund_batch = f_fund.result()
+    stock_list = f_sl.result()
+    commodity_data = f_commodity.result()
+    global_markets = f_global.result()
+    global_penalty, global_warn, _ = calc_global_risk(global_markets)
+    ah_data = f_ah.result()
+
     print(f"  板块: {', '.join(list(hot_sectors)[:5])}" if hot_sectors else "  板块: 无数据")
     print(f"  龙虎榜 {len(billboard_data)} 只 | 涨停 {limit_up} 跌停 {limit_down}")
+    if global_warn:
+        print(f"  ⚠ {global_warn} (扣{abs(global_penalty)}分)")
 
-    # ── 股票列表+资金 ──
-    print()
-    print("[4/8] 获取股票列表+资金...")
-    capital_rank = fetch_capital_flow_rank(top_n=300)
-    fund_batch = fetch_fundamentals_batch()
-    stock_list = fetch_stock_list_sina()
     if stock_list.empty:
         print("[错误] 无法获取股票列表")
         return
 
     # T+5 预筛选（比T+1更宽）
-    stock_list = stock_list[
-        (stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 100) &
-        (stock_list["涨跌幅"] > -5) & (stock_list["涨跌幅"] < 5) &  # 不追涨杀跌
-        (stock_list["换手率"] >= 1.5) & (stock_list["量比"] >= 0.6)
-    ]
+    stock_list = _prefilter(stock_list, PREFILTER_GO5)
     capital_codes = set(capital_rank.keys())
     bb_codes = set(billboard_data.keys())
     p1 = stock_list[stock_list["代码"].isin(capital_codes & bb_codes)]["代码"].tolist()
@@ -4823,6 +4835,14 @@ def go5_decision():
             if any(vi in name for vi in veto_industries):
                 return None
 
+        # ★ 多维度风险检测（与T+1一致）
+        commodity_pen, commodity_warn = check_commodity_risk(stock_ind, name, commodity_data)
+        rally_pen, rally_warn = check_consecutive_rally(kl)
+        ah_pen, ah_warn = check_ah_premium_risk(code, name, ah_data)
+        current_turnover = row.get("换手率", 0) or 0
+        turnover_adj, turnover_label = analyze_turnover_depth(kl, current_turnover)
+        macro_adj, macro_label = check_macro_trend_fit(stock_ind, name, trend_industries)
+
         # 周线趋势 + 历史形态
         wt_adj, _ = calc_weekly_trend(kl)
         tc_adj, _ = classify_trend_context(kl)
@@ -4839,6 +4859,15 @@ def go5_decision():
 
         if not passed:
             return None
+
+        # ★ 风险惩罚扣分（T+5持仓更久，风险更大）
+        risk_penalty = commodity_pen + rally_pen + ah_pen + min(global_penalty, 0)
+        tech_score += risk_penalty
+
+        # 合并风险警告到理由
+        risk_warns = [w for w in [commodity_warn, rally_warn, ah_warn, global_warn, turnover_label, macro_label] if w]
+        if risk_warns:
+            r = r + "；⚠" + "，".join(risk_warns) if r else "⚠" + "，".join(risk_warns)
 
         has_combo = d.get("黄金组合匹配", False)
         # 推荐等级

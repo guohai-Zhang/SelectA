@@ -559,18 +559,15 @@ def api_go():
                 go_th = (cal_threshold if cal_weights else 100) + lc_bonus
                 sig_q = d.get("信号质量", "C级")
                 has_combo = d.get("黄金组合匹配", False)
-                high_q = "A级" in sig_q  # ★ A级=2+高胜率信号
-                mid_q = "B级" in sig_q   # ★ B级=1个高胜率信号
-
-                # ★ 推荐等级：回测验证，黄金组合64%胜率，>=120分62%胜率
-                if total_score >= go_th + 20 and has_combo:
-                    rec_level = "强推荐"  # ★ 黄金组合+高分=强推荐（回测64%+）
-                elif total_score >= go_th + 10 and (has_combo or high_q):
-                    rec_level = "推荐"    # ★ 高分+A级信号=推荐（回测57%+）
-                elif total_score >= go_th and (high_q or mid_q):
-                    rec_level = "弱推荐"  # ★ 达标+至少1个高胜率信号
+                # 推荐等级（与CLI go_decision一致）
+                if total_score >= go_th and has_combo:
+                    rec_level = "强推荐"
+                elif total_score >= go_th and "C级" not in sig_q:
+                    rec_level = "推荐"
                 elif total_score >= go_th:
-                    rec_level = "仅参考"  # ★ 达标但无高胜率信号=仅参考（回测53%，不赚钱）
+                    rec_level = "弱推荐"
+                elif total_score >= go_th * 0.7:
+                    rec_level = "弱推荐"
                 else:
                     rec_level = "仅参考"
                 latest = kl.iloc[-1]
@@ -646,28 +643,28 @@ def api_go():
                 if r not in selected:
                     selected.append(r)
 
-            # ★ 信心指数 — 更保守的计算
-            confidence = 40  # ★ 基础值从50降到40
-            confidence += min(sentiment_score, 10)  # ★ 情绪最多+10（从15降）
-            confidence += min(int(news_score * 1.5), 10)  # ★ 新闻最多+10（从15降）
-            # ★ 基于推荐等级而非纯评分
-            top_level = selected[0].get("推荐等级", "仅参考")
-            if top_level == "强推荐":
-                confidence += 20
-            elif top_level == "推荐":
-                confidence += 12
-            elif top_level == "弱推荐":
+            # 信心指数（与CLI go_decision一致）
+            confidence = 50
+            confidence += min(sentiment_score, 15)
+            confidence += min(int(news_score * 2), 15)
+            if selected[0]["评分"] >= 140:
+                confidence += 15
+            elif selected[0]["评分"] >= 110:
+                confidence += 10
+            if selected[0].get("聪明钱分", 0) >= 30:
                 confidence += 5
-            # ★ 多只候选信心加成
-            strong_count = sum(1 for s in selected if s["推荐等级"] in ("强推荐", "推荐"))
-            confidence += strong_count * 3
-            # 市场熔断时降低信心
+            top_sig_q = selected[0].get("信号质量", "")
+            if "A级" in top_sig_q:
+                confidence += 10
+            elif "B级" in top_sig_q:
+                confidence += 3
             if market_blocked:
                 confidence -= 30
-            # ★ 全球风险
-            if global_penalty < -5:
+            if global_penalty < -10:
                 confidence -= 10
-            confidence = max(15, min(confidence, 85))  # ★ 上限从95降到85（永远不要太自信）
+            elif global_penalty < -5:
+                confidence -= 5
+            confidence = max(20, min(confidence, 95))
 
             # 连板统计
             boards_count = {}

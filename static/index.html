@@ -15,13 +15,13 @@
   --text:#e0e0e0;--text2:#888;--text3:#555;
   --red:#e53935;--green:#43a047;--gold:#ffd740;
   --blue:#42a5f5;--purple:#ab47bc;
-  --tab-h:56px;--safe-b:env(safe-area-inset-bottom,0px);
+  --tab-h:56px;--safe-b:env(safe-area-inset-bottom,0px);--safe-t:env(safe-area-inset-top,0px);
 }
 body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,sans-serif;
   font-size:14px;line-height:1.5;overflow:hidden;height:100vh;
   padding-bottom:calc(var(--tab-h) + var(--safe-b))}
 .page{display:none;height:calc(100vh - var(--tab-h) - var(--safe-b));overflow-y:auto;
-  padding:12px;-webkit-overflow-scrolling:touch}
+  padding:calc(12px + var(--safe-t)) 12px 12px;-webkit-overflow-scrolling:touch}
 .page.active{display:block}
 /* 底部标签栏 */
 .tabs{position:fixed;bottom:0;left:0;right:0;height:calc(var(--tab-h) + var(--safe-b));

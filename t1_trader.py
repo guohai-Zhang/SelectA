@@ -1679,6 +1679,10 @@ def check_consecutive_rally(kline):
         penalty -= 15; warnings.append(f"连涨{consecutive_up}天")
     elif consecutive_up >= 5:
         penalty -= 8; warnings.append(f"连涨{consecutive_up}天")
+    elif consecutive_up >= 4:
+        penalty -= 5; warnings.append(f"连涨{consecutive_up}天")
+    elif consecutive_up >= 3:
+        penalty -= 3; warnings.append(f"连涨{consecutive_up}天")
 
     if cum_gain >= 30:
         penalty -= 25; warnings.append(f"10日涨{cum_gain:.0f}%")
@@ -2577,15 +2581,18 @@ HIGH_WINRATE_SIGNALS = {
     "量价背离_抛压衰竭",  # 新增：抛压衰竭是底部确认信号
 }
 
-# ── 低胜率信号（回测<49%，不应给正分）──
+# ── 低胜率信号（回测<50%，不应给正分）──
 LOW_WINRATE_SIGNALS = {
-    "KDJ_多头",           # 49.4%
-    "形态_阳线",          # 48.4%
-    "MACD_红柱",          # 48.5%
-    "MACD_红柱放大",      # 48.1%
-    "MA_多头排列",        # 48.1%
-    "MA_站上MA5",         # 48.1%
-    "RSI_偏高",           # 47.4%（实际应为看空信号）
+    "KDJ_多头",           # 49.6%
+    "形态_阳线",          # 48.8%
+    "MACD_红柱",          # 50.7%
+    "MACD_红柱放大",      # 47.8%
+    "MACD_金叉",          # 48.0%
+    "MA_多头排列",        # 48.8%
+    "MA_站上MA5",         # 48.5%
+    "量价_放量上涨",      # 45.2%（反指标）
+    "量价_量升价涨",      # 45.3%（反指标）
+    "RSI_偏高",           # 47.8%（实际应为看空信号）
     "RSI_强势",           # 48.1%
     "形态_阳包阴",        # 47.5%
     "形态_锤子线",        # 47.6%
@@ -2660,17 +2667,21 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     # === 信号质量评估 ===
     sig_quality, high_count, low_count = calc_signal_quality(fired)
 
-    # ★ 低胜率信号惩罚加强
+    # ★ 信号质量门槛（无高胜率信号 = 不可靠，重扣）
+    if high_count == 0:
+        score -= 20  # C级信号：无任何高胜率信号支撑，基本不可靠
     if low_count >= 3 and high_count == 0:
-        score -= 15  # 全是低胜率信号，重扣（从-10加到-15）
+        score -= 10  # 全是低胜率信号，额外扣分
     elif low_count >= 2 and high_count == 0:
-        score -= 8   # ★ 新增：2个低胜率也要扣分
+        score -= 5
 
-    # 高胜率信号奖励
-    if high_count >= 3:
-        score += 12  # 3个以上高胜率信号共振，强烈看多
+    # 高胜率信号奖励（加大力度，拉开A/B/C差距）
+    if high_count >= 4:
+        score += 18  # 4个以上高胜率信号超强共振
+    elif high_count >= 3:
+        score += 12  # 3个高胜率信号共振
     elif high_count >= 2:
-        score += 6   # 2个高胜率信号
+        score += 8   # 2个高胜率信号（从6提到8）
 
     # === 黄金组合加分（加大力度）===
     combo_bonus = 0
@@ -2943,6 +2954,18 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
     elif bearish_count >= 2:
         score -= 8
         details["利空叠加"] = f"{bearish_count}项看空"
+
+    # ★ 大振幅惩罚（当日振幅>7%说明情绪过热或恐慌，次日反转概率高）
+    high = latest.get("最高", 0)
+    low = latest.get("最低", 0)
+    if low > 0:
+        amplitude = (high - low) / low * 100
+        if amplitude >= 10:
+            score -= 10
+            details["振幅风险"] = f"振幅{amplitude:.1f}%(-10)"
+        elif amplitude >= 7:
+            score -= 5
+            details["振幅风险"] = f"振幅{amplitude:.1f}%(-5)"
 
     # ★ 总分上限280（避免各维度叠加超标）
     score = min(score, 280)

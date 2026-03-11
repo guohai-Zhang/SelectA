@@ -18,8 +18,8 @@ import t1_trader as t1
 
 # ── 低资源模式（0.1 CPU / 512MB）──
 # 线程数和候选上限适配低配机器
-WORKERS = 4          # 线程池大小（8→4，减少CPU争抢）
-GO_OTHERS_CAP = 50   # go决策中无信号股票上限（200→50，大幅减少无效分析）
+WORKERS = 8          # 线程池大小（与CLI一致）
+GO_OTHERS_CAP = 200  # go决策中无信号股票上限（与CLI一致）
 SCAN_OTHERS_CAP = 100  # scan中非优先股上限
 
 # ── 简单缓存 ──
@@ -618,26 +618,19 @@ def api_go():
                 }})
                 return
 
+            # ── 排序选股（与CLI go_decision一致：纯评分排序+行业分散）──
             results.sort(key=lambda x: x["评分"], reverse=True)
 
-            # ★ 过滤：只保留"推荐"及以上等级（仅参考的不进入决策）
-            qualified = [r for r in results if r["推荐等级"] in ("强推荐", "推荐", "弱推荐")]
-            if not qualified:
-                qualified = results[:3]  # 实在没有就取前3但降低信心
-
-            # 选3只，优先不同行业分散风险，优先高推荐等级
-            level_order = {"强推荐": 0, "推荐": 1, "弱推荐": 2, "仅参考": 3}
-            qualified.sort(key=lambda x: (level_order.get(x["推荐等级"], 3), -x["评分"]))
-            selected = [qualified[0]]
-            used_ind = {qualified[0].get("行业", "")}
-            for r in qualified[1:]:
+            selected = [results[0]]
+            used_ind = {results[0].get("行业", "")}
+            for r in results[1:]:
                 if len(selected) >= 3:
                     break
                 r_ind = r.get("行业", "")
                 if r_ind and r_ind not in used_ind:
                     selected.append(r)
                     used_ind.add(r_ind)
-            for r in qualified[1:]:
+            for r in results[1:]:
                 if len(selected) >= 3:
                     break
                 if r not in selected:
@@ -658,8 +651,7 @@ def api_go():
                 confidence += 10
             elif "B级" in top_sig_q:
                 confidence += 3
-            if market_blocked:
-                confidence -= 30
+            # market_blocked惩罚已移除，与CLI一致
             if global_penalty < -10:
                 confidence -= 10
             elif global_penalty < -5:

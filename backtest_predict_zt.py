@@ -508,6 +508,131 @@ def run_predict_zt_backtest(sample_size=300, days=250):
         print(f"  {label:>12}: {len(sub):>4} ({pct:>5.1f}%) {bar}")
 
     # ============================================================
+    # 七、v3评分模拟回测
+    print()
+    print("=" * 65)
+    print("  七、v3评分模拟回测（验证新评分体系）")
+    print("=" * 65)
+    print()
+
+    def sim_v3_score(row):
+        """模拟v3评分（用回测可见因子）"""
+        chg = row["day_chg"]
+        pullback = row["pullback"]
+        vr = row["vol_ratio"]
+        ve = row["vol_expand"]
+        prev3_max = row["prev3_max_chg"]
+        ma_b = row["ma_bull"]
+        above20 = row["above_ma20"]
+        macd_b = row["macd_bull"]
+        p5r = row["pre5_ret"]
+
+        # 1. 走势 (0-40)
+        m = 0
+        if chg <= 0:
+            m = -20
+        elif chg >= 5:
+            m = 22
+        elif chg >= 3:
+            m = 16
+        elif chg >= 2:
+            m = 10
+        elif chg >= 1:
+            m = 5
+        else:
+            m = 2
+        if chg > 0:
+            if pullback < 1:
+                m += 15
+            elif pullback < 2:
+                m += 8
+            elif pullback < 3:
+                m += 2
+            else:
+                m -= 5
+        m = max(-20, min(40, m))
+
+        # 2. 量能 (0-25)
+        v = 0
+        if vr >= 5: v += 13
+        elif vr >= 3: v += 11
+        elif vr >= 2: v += 8
+        elif vr >= 1.5: v += 4
+        else: v += 1
+        if ve >= 3: v += 10
+        elif ve >= 2: v += 7
+        elif ve >= 1.5: v += 3
+        to = row.get("turnover", 0)
+        if 3 <= to <= 8: v += 2
+        v = min(25, v)
+
+        # 3. 蓄势 (0-15)
+        k = 0
+        if prev3_max < 3:
+            k += 8
+            if prev3_max < 1.5: k += 2
+        elif prev3_max < 5:
+            k += 3
+        if ve >= 2 and prev3_max < 3: k += 2
+        if p5r < -5: k += 4
+        elif p5r > 5: k -= 3
+        k = max(-3, min(15, k))
+
+        # 4. 趋势 (0-10)
+        t = 0
+        if above20: t += 3
+        else: t -= 5
+        if ma_b: t += 2
+        elif vr >= 1.5: t += 1  # ma5>ma10 approximation
+        if macd_b: t += 2
+        t = max(-5, min(10, t))
+
+        return max(0, min(100, m + v + k + t))
+
+    df["v3_score"] = df.apply(sim_v3_score, axis=1)
+
+    print("  v3评分分布 vs 次日胜率:")
+    print()
+    for lo, hi, label in [(0, 30, " 0-29(弱)"),
+                           (30, 40, "30-39"),
+                           (40, 50, "40-49"),
+                           (50, 60, "50-59(门槛)"),
+                           (60, 70, "60-69"),
+                           (70, 80, "70-79"),
+                           (80, 100, "80+ (强)")]:
+        sub = df[(df["v3_score"] >= lo) & (df["v3_score"] < hi)]
+        n = len(sub)
+        if n < 10:
+            print(f"  {label}: n={n:>5} (样本不足)")
+            continue
+        wr = (sub["ret_close"] > 0).sum() / n * 100
+        avg = sub["ret_close"].mean()
+        zt = sub["hit_zt"].sum() / n * 100
+        print(f"  {label}: n={n:>5} 次日胜率{wr:>5.1f}% 均盈{avg:>+5.2f}% 涨停{zt:>4.1f}%")
+
+    # v3>=50 vs <50
+    print()
+    above50 = df[df["v3_score"] >= 50]
+    below50 = df[df["v3_score"] < 50]
+    if len(above50) > 0:
+        wr_a = (above50["ret_close"] > 0).sum() / len(above50) * 100
+        avg_a = above50["ret_close"].mean()
+        print(f"  v3>=50(推荐): n={len(above50):>5} 次日胜率{wr_a:.1f}% 均盈{avg_a:+.2f}%")
+    if len(below50) > 0:
+        wr_b = (below50["ret_close"] > 0).sum() / len(below50) * 100
+        avg_b = below50["ret_close"].mean()
+        print(f"  v3< 50(过滤): n={len(below50):>5} 次日胜率{wr_b:.1f}% 均盈{avg_b:+.2f}%")
+
+    # v3>=60
+    above60 = df[df["v3_score"] >= 60]
+    if len(above60) > 0:
+        wr_60 = (above60["ret_close"] > 0).sum() / len(above60) * 100
+        avg_60 = above60["ret_close"].mean()
+        print(f"  v3>=60(高质量): n={len(above60):>5} 次日胜率{wr_60:.1f}% 均盈{avg_60:+.2f}%")
+
+    print()
+
+    # ============================================================
     print()
     print("=" * 65)
     print("  回测结论")

@@ -6895,30 +6895,35 @@ PREFILTER_PREDICT_ZT = {
 def score_predict_zt(code, stock_info, kline, capital_info=None,
                      hot_sectors=None, zt_pool=None, near_limit_codes=None):
     """
-    涨停预测评分（满分100）— 回测v2校准版
+    涨停预测评分（满分100）— 回测v3校准版
 
     核心目标：次日卖出盈利（不仅仅是涨停）
     回测结论（11386笔，300只股×250天）：
     基准(开盘涨0.5-5%全买): 次日胜率49.7%, 均盈+0.44%
 
-    v2回测关键发现（按次日胜率排序）：
-    - 低回撤(<1%):              次日胜率77.4%, 均盈+2.83%  ★盘中可见最强信号
-    - 量比>=3:                  次日胜率67.9%, 均盈+3.19%  ★量能核心
-    - 量能爆发>=2x:              次日胜率69.1%, 均盈+2.78%
-    - 前3日横盘(<3%)+量比>=3:     次日胜率80.5%, 均盈+4.48%  ★组合王
-    - 今日回落(买后跌):            次日胜率25.7%             ★必须回避！
-    - MA20下方:                  次日胜率45.2%             ★硬门槛
+    v3校准依据（按次日胜率，单因子）：
+    - 今日涨>=5%:    92.3% ★★★ 盘中最强信号（严重低估已修正）
+    - 今日涨>=3%:    88.8% ★★★
+    - 低回撤(<1%):   77.4% ★★
+    - 量能爆发>=3x:   71.8% ★
+    - 量比>=3:       67.9% ★
+    - 前5日跌>5%:    57.2%（v2遗漏，已补充）
+    - 收盘在高点:     56.4%
+    - 站上MA20:     52.1%
+    - 前3日横盘:     50.4%（单独弱，组合强）
+    - 多头排列:      48.2%（低于基准！v2高估已修正）
+    - 前5日涨>5%:   43.6%（过热，需惩罚）
 
-    最优组合（10:30可见因子）：
-    - 量比>=2 + 多头 + 前3日横盘 + 低回撤: ~92%胜率
-    - 量比>=3 + 站上MA20 + 前3日横盘:     81.4%胜率
-    - 低回撤 + 量比>=2 + 多头:            88.3%胜率
+    高胜率组合：
+    - 今日涨3%+ + 量比>=2 + 前3日横盘:  94.9%, n=275
+    - 量比>=2 + MA20 + 低回撤 + 涨3%+: 93.2%, n=279
+    - 低回撤 + 量比>=2 + 多头:          88.3%, n=222
 
     评分维度：
-    1. 走势强度 (0-30): 低回撤+稳步上攻 — v2最强盘中信号
+    1. 今日走势 (0-40): 涨幅+低回撤 — v3最强因子，大幅提权
     2. 量能异动 (0-25): 量比+量能爆发 — 核心燃料
-    3. 蓄势形态 (0-20): 前3日横盘 — 组合提升巨大
-    4. 趋势确认 (0-15): 多头排列+MA20门槛
+    3. 蓄势形态 (0-15): 前3日横盘+前5日趋势 — 组合提升
+    4. 趋势确认 (0-10): MA20门槛+多头(降权)
     5. 市场&资金 (0-10): 环境+资金流
     """
     score = 0
@@ -6938,40 +6943,47 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
 
     open_gap = (open_price - prev_close) / prev_close * 100 if prev_close > 0 else 0
 
-    # ── 1. 走势强度 (0-30)（v2最强信号：低回撤=稳步上攻=明天继续涨）──
-    # 回测：低回撤(<1%) 次日胜率77.4%，回撤>=3% 仅27.8%
-    # 回测：今日回落(买后跌) 次日胜率25.7% — 必须重罚
+    # ── 1. 今日走势 (0-40)（v3核心：涨幅+回撤，回测最强预测因子）──
+    # 回测：涨>=5% 次日92.3%, 涨>=3% 次日88.8%, 低回撤77.4%, 回落仅25.7%
     momentum_score = 0
 
     pullback = amplitude - chg if amplitude > chg else 0  # 回撤幅度
 
+    # ── 涨幅分（v3大幅提权：从+3/+5提升到+22/+16）──
     if chg <= 0:
         # 买入后回落：回测次日胜率仅25.7%，强烈惩罚
-        momentum_score = -15
+        momentum_score = -20
         reasons.append(f"冲高回落(涨{chg:.1f}%,回测次日仅26%胜率)")
-    elif pullback < 1:
-        # 低回撤：回测77.4%胜率
-        momentum_score = 25
-        reasons.append(f"稳步上攻无回撤(回测77%胜率)")
-    elif pullback < 2:
-        momentum_score = 18
-        reasons.append("走势坚决小回撤")
-    elif pullback < 3:
+    elif chg >= 5:
+        momentum_score = 22
+        reasons.append(f"涨{chg:.1f}%强势(回测92%胜率)")
+    elif chg >= 3:
+        momentum_score = 16
+        reasons.append(f"涨{chg:.1f}%(回测89%胜率)")
+    elif chg >= 2:
         momentum_score = 10
+    elif chg >= 1:
+        momentum_score = 5
     else:
         momentum_score = 2
-        reasons.append(f"回撤{pullback:.1f}%(回测28%胜率)")
 
-    # 涨幅加成（盘中可见）
-    if chg >= 5:
-        momentum_score += 5
-        reasons.append(f"涨{chg:.1f}%强势")
-    elif chg >= 3:
-        momentum_score += 3
+    # ── 回撤分（叠加）──
+    if chg > 0:
+        if pullback < 1:
+            momentum_score += 15
+            reasons.append("稳步上攻无回撤(回测77%胜率)")
+        elif pullback < 2:
+            momentum_score += 8
+            reasons.append("走势坚决小回撤")
+        elif pullback < 3:
+            momentum_score += 2
+        else:
+            momentum_score -= 5
+            reasons.append(f"回撤{pullback:.1f}%(回测28%胜率)")
 
-    momentum_score = max(-15, min(30, momentum_score))
+    momentum_score = max(-20, min(40, momentum_score))
     score += momentum_score
-    details["走势"] = f"涨{chg:.1f}% 回撤{pullback:.1f}% ({momentum_score}/30)"
+    details["走势"] = f"涨{chg:.1f}% 回撤{pullback:.1f}% ({momentum_score}/40)"
 
     # ── 2. 量能异动 (0-25)（量比>=2: 67%胜率, >=3: 68%）──
     vol_score = 0
@@ -7012,7 +7024,9 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
     score += vol_score
     details["量能"] = f"量比{vol_ratio:.1f} 爆发{vol_expand:.1f}x ({vol_score}/25)"
 
-    # ── 3. 蓄势形态 (0-20)（前3日横盘: 组合后80%+胜率）──
+    # ── 3. 蓄势形态 (0-15)（前3日横盘+前5日趋势，v3降权+补前5日）──
+    # 回测：前3日横盘单独50.4%（弱），但组合后80%+
+    # 回测：前5日跌>5% 57.2%, 前5日涨>5% 43.6%（v2遗漏）
     kline_score = 0
 
     if kline is not None and len(kline) >= 5:
@@ -7020,25 +7034,38 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
         prev3_chgs = [abs(prev_days.iloc[i].get("涨跌幅", 0) or 0) for i in range(len(prev_days))]
 
         if all(c < 3 for c in prev3_chgs):
-            kline_score += 15
+            kline_score += 8
             avg_chg = sum(prev3_chgs) / len(prev3_chgs)
             if avg_chg < 1.5:
-                kline_score += 3
+                kline_score += 2
                 reasons.append("3日窄幅横盘蓄势")
             else:
                 reasons.append("3日小幅整理")
         elif all(c < 5 for c in prev3_chgs):
-            kline_score += 6
+            kline_score += 3
 
-        if vol_expand >= 2 and kline_score >= 15:
+        # 横盘+量能组合加成（回测：横盘+量比>=2 75.8%）
+        if vol_expand >= 2 and kline_score >= 8:
             kline_score += 2
             reasons.append("横盘后放量爆发!")
 
-    kline_score = min(20, kline_score)
-    score += kline_score
-    details["蓄势"] = f"({kline_score}/20)"
+    # ── 前5日趋势（v3新增）──
+    if kline is not None and len(kline) >= 6:
+        prev5_ret = 0
+        for i in range(-6, -1):
+            prev5_ret += kline.iloc[i].get("涨跌幅", 0) or 0
+        if prev5_ret < -5:
+            kline_score += 4
+            reasons.append(f"前5日跌{prev5_ret:.1f}%超跌反弹(回测57%胜率)")
+        elif prev5_ret > 5:
+            kline_score -= 3
+            reasons.append(f"前5日涨{prev5_ret:.1f}%过热(回测仅44%胜率)")
 
-    # ── 4. 趋势确认 (0-15)（站上MA20: 52%胜率 vs 下方45%）──
+    kline_score = max(-3, min(15, kline_score))
+    score += kline_score
+    details["蓄势"] = f"({kline_score}/15)"
+
+    # ── 4. 趋势确认 (0-10)（v3降权：多头排列48.2%低于基准，从+8降到+2）──
     trend_score = 0
 
     if kline is not None and len(kline) >= 20:
@@ -7048,25 +7075,25 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
         ma20 = latest.get("MA20", 0) or 0
 
         if ma20 > 0 and price > ma20:
-            trend_score += 5
+            trend_score += 3
         elif ma20 > 0:
-            trend_score -= 8
+            trend_score -= 5
             reasons.append("MA20下方(回测次日仅45%胜率)")
 
+        # 多头排列：v3从+8降到+2（回测48.2%低于基准49.7%）
         if ma5 > 0 and ma10 > 0 and ma20 > 0 and ma5 > ma10 > ma20:
-            trend_score += 8
-            reasons.append("多头排列")
+            trend_score += 2
         elif ma5 > 0 and ma10 > 0 and ma5 > ma10:
-            trend_score += 3
+            trend_score += 1
 
         dif = latest.get("DIF", 0) or 0
         dea = latest.get("DEA", 0) or 0
         if dif > dea:
             trend_score += 2
 
-    trend_score = max(-8, min(15, trend_score))
+    trend_score = max(-5, min(10, trend_score))
     score += trend_score
-    details["趋势"] = f"({trend_score}/15)"
+    details["趋势"] = f"({trend_score}/10)"
 
     # ── 5. 市场&资金 (0-10) ──
     extra_score = 0

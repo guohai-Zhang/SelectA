@@ -6568,10 +6568,8 @@ def scan_zt_board(top_n=15):
     capital_rank = f_cap.result()
     limit_up, limit_down = f_limit.result()
 
-    hot_sector_names = []
-    for cat in hot_sectors:
-        for s in hot_sectors[cat]:
-            hot_sector_names.append(s["板块名称"])
+    # get_hot_sectors() 返回 set of 板块名称
+    hot_sector_names = list(hot_sectors) if hot_sectors else []
 
     # 创建股票信息索引
     stock_info = {}
@@ -6579,6 +6577,29 @@ def scan_zt_board(top_n=15):
         for _, row in stock_list.iterrows():
             code = str(row.get("代码", ""))
             stock_info[code] = row.to_dict()
+
+    # 如果涨停池API失效，从行情列表中筛选涨停股作为候选
+    if not zt_pool and not stock_list.empty:
+        zt_from_list = stock_list[
+            (stock_list["涨跌幅"] >= 9.8) &
+            (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+            (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+        ]
+        for _, row in zt_from_list.iterrows():
+            code = str(row.get("代码", ""))
+            zt_pool[code] = {
+                "连板数": 1,  # 无法确定，默认首板
+                "涨停原因": "",
+                "封单额": 0,
+                "首次封板时间": "",
+                "最后封板时间": "",
+                "炸板次数": 0,
+            }
+        if zt_pool:
+            print(f"  (涨停池API无数据，从行情列表筛选 {len(zt_pool)} 只涨停股)")
+
+    # 昨日涨停同理：如果API失效，用K线反推
+    # （暂不处理，昨日数据缺失不影响核心功能）
 
     print(f"  今日涨停 {limit_up} 只，跌停 {limit_down} 只")
     print(f"  涨停池 {len(zt_pool)} 只，昨日涨停 {len(yesterday_zt)} 只")
@@ -6606,11 +6627,7 @@ def scan_zt_board(top_n=15):
             return None
         kline = calc_all_indicators(kline)
 
-        cap_info = None
-        for item in capital_rank:
-            if item.get("代码") == code:
-                cap_info = item
-                break
+        cap_info = capital_rank.get(code) if isinstance(capital_rank, dict) else None
 
         s, d, r = score_zt_stock(
             code, zt_info, kline,
@@ -6642,6 +6659,7 @@ def scan_zt_board(top_n=15):
         }
 
     zt_codes = list(zt_pool.keys())
+    err_count = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(analyze_zt, c): c for c in zt_codes}
         for f in as_completed(futures):
@@ -6649,8 +6667,12 @@ def scan_zt_board(top_n=15):
                 r = f.result()
                 if r:
                     zt_results.append(r)
-            except Exception:
-                pass
+            except Exception as e:
+                err_count += 1
+                if err_count <= 3:
+                    print(f"  [调试] 分析异常: {e}")
+    if err_count:
+        print(f"  [警告] {err_count} 只分析失败")
 
     zt_results.sort(key=lambda x: x["评分"], reverse=True)
     print(f"  分析完成，{len(zt_results)} 只有效涨停股")

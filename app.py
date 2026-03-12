@@ -1049,16 +1049,27 @@ def api_ztb():
             capital_rank = f_cap.result()
             limit_up, limit_down = f_limit.result()
 
-            hot_sector_names = []
-            for cat in hot_sectors:
-                for s in hot_sectors[cat]:
-                    hot_sector_names.append(s["板块名称"])
+            hot_sector_names = list(hot_sectors) if hot_sectors else []
 
             stock_info = {}
             if not stock_list.empty:
                 for _, row in stock_list.iterrows():
                     code = str(row.get("代码", ""))
                     stock_info[code] = row.to_dict()
+
+            # 涨停池API失效时，从行情列表筛选
+            if not zt_pool and not stock_list.empty:
+                zt_from_list = stock_list[
+                    (stock_list["涨跌幅"] >= 9.8) &
+                    (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+                    (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+                ]
+                for _, row in zt_from_list.iterrows():
+                    code = str(row.get("代码", ""))
+                    zt_pool[code] = {
+                        "连板数": 1, "涨停原因": "", "封单额": 0,
+                        "首次封板时间": "", "最后封板时间": "", "炸板次数": 0,
+                    }
 
             yield sse({"type": "progress", "msg": f"分析 {len(zt_pool)} 只涨停股...", "pct": 25})
 
@@ -1082,11 +1093,7 @@ def api_ztb():
                     return None
                 kline = t1.calc_all_indicators(kline)
 
-                cap_info = None
-                for item in capital_rank:
-                    if item.get("代码") == code:
-                        cap_info = item
-                        break
+                cap_info = capital_rank.get(code) if isinstance(capital_rank, dict) else None
 
                 s, d, r = t1.score_zt_stock(
                     code, zt_info, kline,

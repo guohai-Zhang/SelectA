@@ -23,8 +23,8 @@ python3 t1_trader.py --calibrate      # Signal weight calibration
 python3 t1_trader.py --go             # T+1 quick decision (top 3)
 python3 t1_trader.py --etf            # ETF wave scan
 python3 t1_trader.py --etf-go         # ETF quick decision
-python3 t1_trader.py --ztb            # Limit-up board scan (涨停板)
-python3 backtest_ztb.py [sample_size] # Limit-up board backtest
+python3 t1_trader.py --ztb            # 涨停扫描：早盘低位预判涨停候选
+python3 backtest_predict_zt.py [sample_size] # 涨停策略回测
 ```
 
 Deploy: Render.com via `render.yaml` (Docker, port 10000).
@@ -45,7 +45,7 @@ Key stages:
 
 Signal system uses **mutual exclusion groups** (MACD, KDJ, RSI, MA, BOLL, volume-price, patterns, capital flow) — only the highest-priority signal fires within each group.
 
-Three trading modes: **T+1** (buy today, sell tomorrow), **T+5** (wave trading, 1-5 day hold), and **涨停板** (limit-up board, buy at limit-up price today, sell at next-day open). ETF analysis has its own parallel pipeline (`evaluate_etf_trend`, `calc_etf_risk`, `scan_etf`). Limit-up board has its own pipeline (`score_zt_stock`, `calc_zt_risk`, `scan_zt_board`).
+Three trading modes: **T+1** (buy today, sell tomorrow), **T+5** (wave trading, 1-5 day hold), and **涨停** (predict limit-up, buy low at 0.5-5%, sell next day). ETF analysis has its own parallel pipeline (`evaluate_etf_trend`, `calc_etf_risk`, `scan_etf`). 涨停 pipeline: `score_predict_zt`, `calc_predict_zt_sell`, `scan_zt_board`.
 
 ### Web Layer (app.py)
 
@@ -59,7 +59,7 @@ API endpoints:
 - `/api/go` — T+1 quick decision (SSE)
 - `/api/go5` — T+5 wave decision (SSE)
 - `/api/etf` — ETF scan (SSE)
-- `/api/ztb` — Limit-up board scan (SSE)
+- `/api/ztb` — 涨停扫描 (SSE)
 - `/api/trades` — Trade tracking history
 
 ### Frontend (static/index.html)

@@ -1024,6 +1024,185 @@ def api_etf():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── API: 涨停板扫描 (SSE) ──
+
+@app.get("/api/ztb")
+def api_ztb():
+    def generate():
+        try:
+            yield sse({"type": "progress", "msg": "获取涨停数据...", "pct": 5})
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                f_zt = ex.submit(t1.fetch_limit_up_pool)
+                f_yzt = ex.submit(t1.fetch_yesterday_zt_pool)
+                f_sl = ex.submit(t1.fetch_stock_list_sina)
+                f_sentiment = ex.submit(t1.get_sentiment_score)
+                f_hot = ex.submit(t1.get_hot_sectors)
+                f_cap = ex.submit(t1.fetch_capital_flow_rank, 100)
+                f_limit = ex.submit(t1.count_limit_up)
+
+            zt_pool = f_zt.result()
+            yesterday_zt = f_yzt.result()
+            stock_list = f_sl.result()
+            sentiment_score, sentiment_info = f_sentiment.result()
+            hot_sectors = f_hot.result()
+            capital_rank = f_cap.result()
+            limit_up, limit_down = f_limit.result()
+
+            hot_sector_names = []
+            for cat in hot_sectors:
+                for s in hot_sectors[cat]:
+                    hot_sector_names.append(s["板块名称"])
+
+            stock_info = {}
+            if not stock_list.empty:
+                for _, row in stock_list.iterrows():
+                    code = str(row.get("代码", ""))
+                    stock_info[code] = row.to_dict()
+
+            yield sse({"type": "progress", "msg": f"分析 {len(zt_pool)} 只涨停股...", "pct": 25})
+
+            # 分析今日涨停股
+            zt_results = []
+            done = [0]
+            total = len(zt_pool)
+
+            def analyze_zt(code):
+                info = stock_info.get(code, {})
+                name = str(info.get("名称", ""))
+                if "ST" in name or "退市" in name or name.startswith("N ") or name.startswith("C "):
+                    return None
+                price = info.get("最新价", 0) or 0
+                if price < 3 or price > 100:
+                    return None
+
+                zt_info = zt_pool.get(code, {})
+                kline = t1.fetch_kline(code, days=60)
+                if kline.empty or len(kline) < 10:
+                    return None
+                kline = t1.calc_all_indicators(kline)
+
+                cap_info = None
+                for item in capital_rank:
+                    if item.get("代码") == code:
+                        cap_info = item
+                        break
+
+                s, d, r = t1.score_zt_stock(
+                    code, zt_info, kline,
+                    capital_info=cap_info,
+                    hot_sectors=hot_sector_names,
+                    realtime_info=info,
+                    all_zt_pool=zt_pool,
+                )
+                lianban = zt_info.get("连板数", 1) or 1
+                risk = t1.calc_zt_risk(s, price, kline, lianban)
+
+                return {
+                    "代码": code, "名称": name, "最新价": price,
+                    "涨跌幅": info.get("涨跌幅", 0) or 0,
+                    "换手率": info.get("换手率", 0) or 0,
+                    "连板数": lianban,
+                    "封单额": zt_info.get("封单额", 0) or 0,
+                    "首封时间": zt_info.get("首次封板时间", ""),
+                    "炸板次数": zt_info.get("炸板次数", 0) or 0,
+                    "涨停原因": zt_info.get("涨停原因", ""),
+                    "评分": s, "信号": d, "理由": r, "risk": risk,
+                    "类型": "今日涨停",
+                }
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                futures = {executor.submit(analyze_zt, c): c for c in zt_pool.keys()}
+                for f in as_completed(futures):
+                    done[0] += 1
+                    try:
+                        r = f.result()
+                        if r:
+                            zt_results.append(r)
+                    except Exception:
+                        pass
+                    if done[0] % 20 == 0 and total > 0:
+                        pct = 25 + int(done[0] / total * 40)
+                        yield sse({"type": "progress",
+                                   "msg": f"涨停分析 {done[0]}/{total}",
+                                   "pct": min(pct, 65)})
+
+            zt_results.sort(key=lambda x: x["评分"], reverse=True)
+
+            yield sse({"type": "progress", "msg": "统计昨日涨停表现...", "pct": 70})
+
+            # 昨日涨停今日表现
+            yesterday_perf = []
+            for code, yzt_info in yesterday_zt.items():
+                info = stock_info.get(code, {})
+                if not info:
+                    continue
+                name = str(info.get("名称", ""))
+                if "ST" in name or "退市" in name:
+                    continue
+                chg = info.get("涨跌幅", 0) or 0
+                price = info.get("最新价", 0) or 0
+                yesterday_perf.append({
+                    "代码": code, "名称": name, "最新价": price,
+                    "今日涨跌": chg,
+                    "昨日连板": yzt_info.get("连板数", 1),
+                    "昨日封单": yzt_info.get("封单额", 0),
+                    "涨停原因": yzt_info.get("涨停原因", ""),
+                    "今日是否涨停": code in zt_pool,
+                })
+            yesterday_perf.sort(key=lambda x: x["今日涨跌"], reverse=True)
+
+            avg_chg = 0
+            win_rate = 0
+            cont_zt = 0
+            if yesterday_perf:
+                chg_list = [x["今日涨跌"] for x in yesterday_perf]
+                avg_chg = sum(chg_list) / len(chg_list)
+                win_count = sum(1 for c in chg_list if c > 0)
+                win_rate = win_count / len(chg_list) * 100
+                cont_zt = sum(1 for x in yesterday_perf if x["今日是否涨停"])
+
+            yield sse({"type": "progress", "msg": "扫描冲板候选...", "pct": 85})
+
+            # 冲板候选
+            near_limit = t1.fetch_near_limit_stocks(stock_list)
+            near_results = []
+            for _, row in near_limit.iterrows():
+                near_results.append({
+                    "代码": str(row.get("代码", "")),
+                    "名称": str(row.get("名称", "")),
+                    "最新价": row.get("最新价", 0) or 0,
+                    "涨跌幅": row.get("涨跌幅", 0) or 0,
+                    "换手率": row.get("换手率", 0) or 0,
+                    "量比": row.get("量比", 0) or 0,
+                    "类型": "冲板候选",
+                })
+            near_results.sort(key=lambda x: x["涨跌幅"], reverse=True)
+            near_results = near_results[:15]
+
+            yield sse({"type": "result", "data": {
+                "zt_results": zt_results[:20],
+                "yesterday_perf": yesterday_perf[:20],
+                "near_limit": near_results,
+                "summary": {
+                    "今日涨停": limit_up, "今日跌停": limit_down,
+                    "涨停池": len(zt_pool),
+                    "昨日涨停数": len(yesterday_zt),
+                    "昨日均涨": round(avg_chg, 2),
+                    "昨日胜率": round(win_rate, 1),
+                    "连板数": cont_zt,
+                    "冲板候选": len(near_results),
+                    "sentiment": {"score": sentiment_score, "info": sentiment_info},
+                },
+            }})
+
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 # ── API: 模拟实盘回测 (SSE) ──
 
 @app.get("/api/simulate")

@@ -1071,7 +1071,37 @@ def api_ztb():
                         "首次封板时间": "", "最后封板时间": "", "炸板次数": 0,
                     }
 
-            yield sse({"type": "progress", "msg": f"分析 {len(zt_pool)} 只涨停股...", "pct": 25})
+            # 昨日涨停fallback：从K线反推
+            if not yesterday_zt and not stock_list.empty:
+                active_for_yt = stock_list[
+                    (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+                    (stock_list["成交额"] > 0) &
+                    (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+                ].nlargest(500, "成交额")
+
+                yield sse({"type": "progress", "msg": "从K线反推昨日涨停...", "pct": 20})
+
+                def check_yt_zt(code):
+                    kl = t1.fetch_kline(str(code), days=5)
+                    if kl.empty or len(kl) < 2:
+                        return None
+                    chg = kl.iloc[-2].get("涨跌幅", 0) or 0
+                    if chg >= 9.8:
+                        return (str(code), {"连板数": 1, "涨停原因": "", "封单额": 0,
+                                            "首次封板时间": "", "炸板次数": 0})
+                    return None
+
+                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                    futs = {ex.submit(check_yt_zt, c): c for c in active_for_yt["代码"].tolist()}
+                    for f in as_completed(futs):
+                        try:
+                            r = f.result()
+                            if r:
+                                yesterday_zt[r[0]] = r[1]
+                        except Exception:
+                            pass
+
+            yield sse({"type": "progress", "msg": f"分析 {len(zt_pool)} 只涨停股...", "pct": 30})
 
             # 分析今日涨停股
             zt_results = []

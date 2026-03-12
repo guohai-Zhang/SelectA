@@ -6598,8 +6598,42 @@ def scan_zt_board(top_n=15):
         if zt_pool:
             print(f"  (涨停池API无数据，从行情列表筛选 {len(zt_pool)} 只涨停股)")
 
-    # 昨日涨停同理：如果API失效，用K线反推
-    # （暂不处理，昨日数据缺失不影响核心功能）
+    # 昨日涨停fallback：从活跃股K线反推
+    if not yesterday_zt and not stock_list.empty:
+        print("  (昨日涨停池API无数据，从K线反推...)")
+        # 抽样活跃股（按成交额排序取前500只）
+        active_for_yt = stock_list[
+            (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+            (stock_list["成交额"] > 0) &
+            (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+        ].nlargest(500, "成交额")
+        sample_codes = active_for_yt["代码"].tolist()
+
+        def check_yesterday_zt(code):
+            kl = fetch_kline(str(code), days=5)
+            if kl.empty or len(kl) < 2:
+                return None
+            # 倒数第二行是昨日
+            yesterday_row = kl.iloc[-2]
+            chg = yesterday_row.get("涨跌幅", 0) or 0
+            if chg >= 9.8:
+                return (str(code), {
+                    "连板数": 1, "涨停原因": "", "封单额": 0,
+                    "首次封板时间": "", "炸板次数": 0,
+                })
+            return None
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(check_yesterday_zt, c): c for c in sample_codes}
+            for f in as_completed(futures):
+                try:
+                    r = f.result()
+                    if r:
+                        yesterday_zt[r[0]] = r[1]
+                except Exception:
+                    pass
+        if yesterday_zt:
+            print(f"  (从K线反推昨日涨停 {len(yesterday_zt)} 只)")
 
     print(f"  今日涨停 {limit_up} 只，跌停 {limit_down} 只")
     print(f"  涨停池 {len(zt_pool)} 只，昨日涨停 {len(yesterday_zt)} 只")

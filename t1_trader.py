@@ -6895,30 +6895,31 @@ PREFILTER_PREDICT_ZT = {
 def score_predict_zt(code, stock_info, kline, capital_info=None,
                      hot_sectors=None, zt_pool=None, near_limit_codes=None):
     """
-    涨停预测评分（满分100）— 回测校准版
+    涨停预测评分（满分100）— 回测v2校准版
 
+    核心目标：次日卖出盈利（不仅仅是涨停）
     回测结论（11386笔，300只股×250天）：
-    基准(开盘涨0.5-5%全买): 涨停命中4.3%, 次日胜率49.7%, 均盈+0.44%
+    基准(开盘涨0.5-5%全买): 次日胜率49.7%, 均盈+0.44%
 
-    关键因子（按回测胜率排序）：
-    - 量比>=3:          涨停22.3%, 次日胜率67.9%, 均盈+3.19%  ★最核心
-    - 量能爆发>=2x:      涨停15.3%, 次日胜率69.1%, 均盈+2.78%  ★第二核心
-    - 前3日横盘(<3%):    单独一般，但组合后大幅提升            ★蓄势确认
-    - 多头排列:          涨停7.0%, 组合中提升显著              ★趋势确认
-    - 站上MA20:         涨停6.4%, 次日胜率52.1%              ★基本门槛
-    - MACD空头反转:      涨停0.5% → 完全无效！
+    v2回测关键发现（按次日胜率排序）：
+    - 低回撤(<1%):              次日胜率77.4%, 均盈+2.83%  ★盘中可见最强信号
+    - 量比>=3:                  次日胜率67.9%, 均盈+3.19%  ★量能核心
+    - 量能爆发>=2x:              次日胜率69.1%, 均盈+2.78%
+    - 前3日横盘(<3%)+量比>=3:     次日胜率80.5%, 均盈+4.48%  ★组合王
+    - 今日回落(买后跌):            次日胜率25.7%             ★必须回避！
+    - MA20下方:                  次日胜率45.2%             ★硬门槛
 
-    最优组合（回测验证）：
-    - 量比>=3 + 多头 + 前3日横盘:     样本108, 次日胜率83.3%, 均盈+4.72%
-    - 量比>=3 + 站上MA20 + 前3日横盘: 样本221, 次日胜率81.4%, 均盈+4.67%
-    - 量能爆发2x + 前3日横盘:         样本672, 次日胜率77.1%, 均盈+3.35%
+    最优组合（10:30可见因子）：
+    - 量比>=2 + 多头 + 前3日横盘 + 低回撤: ~92%胜率
+    - 量比>=3 + 站上MA20 + 前3日横盘:     81.4%胜率
+    - 低回撤 + 量比>=2 + 多头:            88.3%胜率
 
-    评分维度（回测校准权重）：
-    1. 量能异动 (0-35): 量比+量能爆发 — 回测最关键因子
-    2. 蓄势形态 (0-25): 前3日横盘+放量突破 — 组合提升巨大
-    3. 趋势确认 (0-20): 多头排列+站上MA20 — 必要条件
-    4. 资金流向 (0-10): 主力净流入
-    5. 市场环境 (0-10): 涨停数+冲板数
+    评分维度：
+    1. 走势强度 (0-30): 低回撤+稳步上攻 — v2最强盘中信号
+    2. 量能异动 (0-25): 量比+量能爆发 — 核心燃料
+    3. 蓄势形态 (0-20): 前3日横盘 — 组合提升巨大
+    4. 趋势确认 (0-15): 多头排列+MA20门槛
+    5. 市场&资金 (0-10): 环境+资金流
     """
     score = 0
     details = {}
@@ -6934,96 +6935,110 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
     amplitude = stock_info.get("振幅", 0) or 0
     open_price = stock_info.get("今开", 0) or 0
     prev_close = stock_info.get("昨收", 0) or 0
-    amount = stock_info.get("成交额", 0) or 0
 
-    # ── 1. 量能异动 (0-35)（回测最核心因子）──
-    # 量比>=3: 次日胜率67.9%, 量比>=5: 69.1%
-    # 量能爆发>=2x: 次日胜率69.1%, >=3x: 71.8%
+    open_gap = (open_price - prev_close) / prev_close * 100 if prev_close > 0 else 0
+
+    # ── 1. 走势强度 (0-30)（v2最强信号：低回撤=稳步上攻=明天继续涨）──
+    # 回测：低回撤(<1%) 次日胜率77.4%，回撤>=3% 仅27.8%
+    # 回测：今日回落(买后跌) 次日胜率25.7% — 必须重罚
+    momentum_score = 0
+
+    pullback = amplitude - chg if amplitude > chg else 0  # 回撤幅度
+
+    if chg <= 0:
+        # 买入后回落：回测次日胜率仅25.7%，强烈惩罚
+        momentum_score = -15
+        reasons.append(f"冲高回落(涨{chg:.1f}%,回测次日仅26%胜率)")
+    elif pullback < 1:
+        # 低回撤：回测77.4%胜率
+        momentum_score = 25
+        reasons.append(f"稳步上攻无回撤(回测77%胜率)")
+    elif pullback < 2:
+        momentum_score = 18
+        reasons.append("走势坚决小回撤")
+    elif pullback < 3:
+        momentum_score = 10
+    else:
+        momentum_score = 2
+        reasons.append(f"回撤{pullback:.1f}%(回测28%胜率)")
+
+    # 涨幅加成（盘中可见）
+    if chg >= 5:
+        momentum_score += 5
+        reasons.append(f"涨{chg:.1f}%强势")
+    elif chg >= 3:
+        momentum_score += 3
+
+    momentum_score = max(-15, min(30, momentum_score))
+    score += momentum_score
+    details["走势"] = f"涨{chg:.1f}% 回撤{pullback:.1f}% ({momentum_score}/30)"
+
+    # ── 2. 量能异动 (0-25)（量比>=2: 67%胜率, >=3: 68%）──
     vol_score = 0
+    vol_expand = 1.0
 
-    # 量比（实时数据，10:30时的量比）
     if vol_ratio >= 5:
-        vol_score += 18
-        reasons.append(f"量比{vol_ratio:.1f}极度异动(回测69%胜率)")
+        vol_score += 13
+        reasons.append(f"量比{vol_ratio:.1f}极度异动")
     elif vol_ratio >= 3:
-        vol_score += 15
-        reasons.append(f"量比{vol_ratio:.1f}明显异动(回测68%胜率)")
+        vol_score += 11
+        reasons.append(f"量比{vol_ratio:.1f}异动")
     elif vol_ratio >= 2:
-        vol_score += 10
+        vol_score += 8
         reasons.append(f"量比{vol_ratio:.1f}放量")
     elif vol_ratio >= 1.5:
-        vol_score += 5
+        vol_score += 4
     else:
         vol_score += 1
 
-    # 量能爆发（vs前几日，需要K线数据）
-    vol_expand = 1.0
     if kline is not None and len(kline) >= 4:
         prev3_vol = kline["成交量"].iloc[-4:-1].mean()
         today_vol = kline.iloc[-1].get("成交量", 0) or 0
         if prev3_vol > 0 and today_vol > 0:
             vol_expand = today_vol / prev3_vol
-            if vol_expand >= 5:
-                vol_score += 15
-                reasons.append(f"量能爆发{vol_expand:.1f}x(回测75%胜率)")
-            elif vol_expand >= 3:
-                vol_score += 13
+            if vol_expand >= 3:
+                vol_score += 10
                 reasons.append(f"量能爆发{vol_expand:.1f}x(回测72%胜率)")
             elif vol_expand >= 2:
-                vol_score += 10
-                reasons.append(f"量能倍增{vol_expand:.1f}x(回测69%胜率)")
+                vol_score += 7
+                reasons.append(f"量能倍增{vol_expand:.1f}x")
             elif vol_expand >= 1.5:
-                vol_score += 5
-            else:
-                vol_score += 1
+                vol_score += 3
 
-    # 换手率适中（3-8%最佳）
     if 3 <= turnover <= 8:
         vol_score += 2
-    elif turnover > 15:
-        vol_score -= 2
 
-    vol_score = max(0, min(35, vol_score))
+    vol_score = max(0, min(25, vol_score))
     score += vol_score
-    details["量能"] = f"量比{vol_ratio:.1f} 爆发{vol_expand:.1f}x ({vol_score}/35)"
+    details["量能"] = f"量比{vol_ratio:.1f} 爆发{vol_expand:.1f}x ({vol_score}/25)"
 
-    # ── 2. 蓄势形态 (0-25)（前3日横盘是高胜率组合的关键）──
-    # 前3日横盘(<3%) + 量能爆发: 次日胜率77-83%
+    # ── 3. 蓄势形态 (0-20)（前3日横盘: 组合后80%+胜率）──
     kline_score = 0
-    prev3_calm = False
 
     if kline is not None and len(kline) >= 5:
-        prev_days = kline.iloc[-4:-1]  # 前3天
-
-        # 前3日是否横盘（每日涨跌幅<3%）
+        prev_days = kline.iloc[-4:-1]
         prev3_chgs = [abs(prev_days.iloc[i].get("涨跌幅", 0) or 0) for i in range(len(prev_days))]
+
         if all(c < 3 for c in prev3_chgs):
             kline_score += 15
-            prev3_calm = True
             avg_chg = sum(prev3_chgs) / len(prev3_chgs)
             if avg_chg < 1.5:
                 kline_score += 3
-                reasons.append("3日窄幅横盘蓄势(高胜率信号)")
+                reasons.append("3日窄幅横盘蓄势")
             else:
-                reasons.append("3日小幅整理蓄势")
+                reasons.append("3日小幅整理")
         elif all(c < 5 for c in prev3_chgs):
             kline_score += 6
-            reasons.append("3日相对平稳")
 
-        # 今日放量突破（vs前3日量能对比，和上面的vol_expand一致）
-        if vol_expand >= 2 and prev3_calm:
-            kline_score += 5
-            reasons.append("横盘后放量爆发!")
-        elif vol_expand >= 2:
+        if vol_expand >= 2 and kline_score >= 15:
             kline_score += 2
+            reasons.append("横盘后放量爆发!")
 
-    kline_score = min(25, kline_score)
+    kline_score = min(20, kline_score)
     score += kline_score
-    details["蓄势"] = f"({kline_score}/25)"
+    details["蓄势"] = f"({kline_score}/20)"
 
-    # ── 3. 趋势确认 (0-20)（多头排列+站上MA20=必要条件）──
-    # 多头排列: 涨停命中7%, 站上MA20: 6.4% vs MA20下方: 0.4%!
-    # MA20下方几乎不会涨停（0.4%命中），必须作为硬门槛
+    # ── 4. 趋势确认 (0-15)（站上MA20: 52%胜率 vs 下方45%）──
     trend_score = 0
 
     if kline is not None and len(kline) >= 20:
@@ -7033,76 +7048,47 @@ def score_predict_zt(code, stock_info, kline, capital_info=None,
         ma20 = latest.get("MA20", 0) or 0
 
         if ma20 > 0 and price > ma20:
-            trend_score += 8
+            trend_score += 5
         elif ma20 > 0:
-            trend_score -= 10  # 回测：MA20下方涨停命中仅0.4%，强烈惩罚
-            reasons.append("MA20下方(回测涨停率仅0.4%)")
+            trend_score -= 8
+            reasons.append("MA20下方(回测次日仅45%胜率)")
 
-        if ma5 > 0 and ma10 > 0 and ma20 > 0:
-            if ma5 > ma10 > ma20:
-                trend_score += 10
-                reasons.append("多头排列(回测组合83%胜率)")
-            elif ma5 > ma10:
-                trend_score += 4
-            elif price > ma5:
-                trend_score += 2
+        if ma5 > 0 and ma10 > 0 and ma20 > 0 and ma5 > ma10 > ma20:
+            trend_score += 8
+            reasons.append("多头排列")
+        elif ma5 > 0 and ma10 > 0 and ma5 > ma10:
+            trend_score += 3
 
-        # MACD多头加分（回测6.5%涨停命中）
         dif = latest.get("DIF", 0) or 0
         dea = latest.get("DEA", 0) or 0
         if dif > dea:
             trend_score += 2
-        # 注意：MACD空头反转回测仅0.5%命中率，不加分！
 
-    trend_score = max(-10, min(20, trend_score))
+    trend_score = max(-8, min(15, trend_score))
     score += trend_score
-    details["趋势"] = f"({trend_score}/20)"
+    details["趋势"] = f"({trend_score}/15)"
 
-    # ── 4. 资金流向 (0-10) ──
-    fund_score = 0
+    # ── 5. 市场&资金 (0-10) ──
+    extra_score = 0
+
     if capital_info and isinstance(capital_info, dict):
         net_inflow = capital_info.get("主力净流入", 0) or 0
         if net_inflow > 5000:
-            fund_score = 10
+            extra_score += 5
             reasons.append("主力大幅流入")
         elif net_inflow > 2000:
-            fund_score = 7
-        elif net_inflow > 500:
-            fund_score = 4
+            extra_score += 3
         elif net_inflow < -2000:
-            fund_score = 0
-            reasons.append("主力流出")
-        else:
-            fund_score = 2
-    else:
-        fund_score = 2
+            extra_score -= 2
 
-    score += fund_score
-    details["资金"] = f"({fund_score}/10)"
-
-    # ── 5. 市场环境 (0-10) ──
-    env_score = 0
-
-    if zt_pool:
-        zt_count = len(zt_pool)
-        if zt_count >= 30:
-            env_score += 5
-            reasons.append(f"市场火热({zt_count}只涨停)")
-        elif zt_count >= 15:
-            env_score += 3
-        elif zt_count < 5:
-            env_score -= 3
-            reasons.append(f"市场冰点({zt_count}只涨停)")
-
+    if zt_pool and len(zt_pool) >= 20:
+        extra_score += 3
     if near_limit_codes and len(near_limit_codes) >= 10:
-        env_score += 5
-        reasons.append(f"{len(near_limit_codes)}只冲板")
-    elif near_limit_codes and len(near_limit_codes) >= 5:
-        env_score += 3
+        extra_score += 2
 
-    env_score = max(0, min(10, env_score))
-    score += env_score
-    details["环境"] = f"({env_score}/10)"
+    extra_score = max(0, min(10, extra_score))
+    score += extra_score
+    details["其他"] = f"({extra_score}/10)"
 
     score = max(0, min(100, score))
     reason_str = "；".join(reasons) if reasons else "无明显特征"

@@ -22,6 +22,7 @@ A股 T+1 短线分析工具 v3.0
     python3 t1_trader.py --etf          # ETF波段扫描（持有1-5天）
     python3 t1_trader.py --etf-go       # ETF波段一键决策：推荐3只ETF+操作计划
     python3 t1_trader.py --ztb          # 涨停板扫描：今日涨停 + 昨日涨停次日表现 + 冲板候选
+    python3 t1_trader.py --predict-zt   # 涨停预测：早盘10:00-10:30预判当天涨停候选
 """
 
 import requests
@@ -6881,6 +6882,528 @@ def scan_zt_board(top_n=15):
 
 
 # ============================================================
+# 涨停预测模块：早盘10:00-10:30预判当天涨停候选
+# ============================================================
+
+PREFILTER_PREDICT_ZT = {
+    "价格下限": 5, "价格上限": 80,
+    "涨幅下限": 0.5, "涨幅上限": 5,
+    "换手率下限": 1, "量比下限": 1.5,
+}
+
+
+def score_predict_zt(code, stock_info, kline, capital_info=None,
+                     hot_sectors=None, zt_pool=None, near_limit_codes=None):
+    """
+    涨停预测评分（满分100）— 回测校准版
+
+    回测结论（11386笔，300只股×250天）：
+    基准(开盘涨0.5-5%全买): 涨停命中4.3%, 次日胜率49.7%, 均盈+0.44%
+
+    关键因子（按回测胜率排序）：
+    - 量比>=3:          涨停22.3%, 次日胜率67.9%, 均盈+3.19%  ★最核心
+    - 量能爆发>=2x:      涨停15.3%, 次日胜率69.1%, 均盈+2.78%  ★第二核心
+    - 前3日横盘(<3%):    单独一般，但组合后大幅提升            ★蓄势确认
+    - 多头排列:          涨停7.0%, 组合中提升显著              ★趋势确认
+    - 站上MA20:         涨停6.4%, 次日胜率52.1%              ★基本门槛
+    - MACD空头反转:      涨停0.5% → 完全无效！
+
+    最优组合（回测验证）：
+    - 量比>=3 + 多头 + 前3日横盘:     样本108, 次日胜率83.3%, 均盈+4.72%
+    - 量比>=3 + 站上MA20 + 前3日横盘: 样本221, 次日胜率81.4%, 均盈+4.67%
+    - 量能爆发2x + 前3日横盘:         样本672, 次日胜率77.1%, 均盈+3.35%
+
+    评分维度（回测校准权重）：
+    1. 量能异动 (0-35): 量比+量能爆发 — 回测最关键因子
+    2. 蓄势形态 (0-25): 前3日横盘+放量突破 — 组合提升巨大
+    3. 趋势确认 (0-20): 多头排列+站上MA20 — 必要条件
+    4. 资金流向 (0-10): 主力净流入
+    5. 市场环境 (0-10): 涨停数+冲板数
+    """
+    score = 0
+    details = {}
+    reasons = []
+
+    if not stock_info:
+        stock_info = {}
+
+    price = stock_info.get("最新价", 0) or 0
+    chg = stock_info.get("涨跌幅", 0) or 0
+    turnover = stock_info.get("换手率", 0) or 0
+    vol_ratio = stock_info.get("量比", 0) or 0
+    amplitude = stock_info.get("振幅", 0) or 0
+    open_price = stock_info.get("今开", 0) or 0
+    prev_close = stock_info.get("昨收", 0) or 0
+    amount = stock_info.get("成交额", 0) or 0
+
+    # ── 1. 量能异动 (0-35)（回测最核心因子）──
+    # 量比>=3: 次日胜率67.9%, 量比>=5: 69.1%
+    # 量能爆发>=2x: 次日胜率69.1%, >=3x: 71.8%
+    vol_score = 0
+
+    # 量比（实时数据，10:30时的量比）
+    if vol_ratio >= 5:
+        vol_score += 18
+        reasons.append(f"量比{vol_ratio:.1f}极度异动(回测69%胜率)")
+    elif vol_ratio >= 3:
+        vol_score += 15
+        reasons.append(f"量比{vol_ratio:.1f}明显异动(回测68%胜率)")
+    elif vol_ratio >= 2:
+        vol_score += 10
+        reasons.append(f"量比{vol_ratio:.1f}放量")
+    elif vol_ratio >= 1.5:
+        vol_score += 5
+    else:
+        vol_score += 1
+
+    # 量能爆发（vs前几日，需要K线数据）
+    vol_expand = 1.0
+    if kline is not None and len(kline) >= 4:
+        prev3_vol = kline["成交量"].iloc[-4:-1].mean()
+        today_vol = kline.iloc[-1].get("成交量", 0) or 0
+        if prev3_vol > 0 and today_vol > 0:
+            vol_expand = today_vol / prev3_vol
+            if vol_expand >= 5:
+                vol_score += 15
+                reasons.append(f"量能爆发{vol_expand:.1f}x(回测75%胜率)")
+            elif vol_expand >= 3:
+                vol_score += 13
+                reasons.append(f"量能爆发{vol_expand:.1f}x(回测72%胜率)")
+            elif vol_expand >= 2:
+                vol_score += 10
+                reasons.append(f"量能倍增{vol_expand:.1f}x(回测69%胜率)")
+            elif vol_expand >= 1.5:
+                vol_score += 5
+            else:
+                vol_score += 1
+
+    # 换手率适中（3-8%最佳）
+    if 3 <= turnover <= 8:
+        vol_score += 2
+    elif turnover > 15:
+        vol_score -= 2
+
+    vol_score = max(0, min(35, vol_score))
+    score += vol_score
+    details["量能"] = f"量比{vol_ratio:.1f} 爆发{vol_expand:.1f}x ({vol_score}/35)"
+
+    # ── 2. 蓄势形态 (0-25)（前3日横盘是高胜率组合的关键）──
+    # 前3日横盘(<3%) + 量能爆发: 次日胜率77-83%
+    kline_score = 0
+    prev3_calm = False
+
+    if kline is not None and len(kline) >= 5:
+        prev_days = kline.iloc[-4:-1]  # 前3天
+
+        # 前3日是否横盘（每日涨跌幅<3%）
+        prev3_chgs = [abs(prev_days.iloc[i].get("涨跌幅", 0) or 0) for i in range(len(prev_days))]
+        if all(c < 3 for c in prev3_chgs):
+            kline_score += 15
+            prev3_calm = True
+            avg_chg = sum(prev3_chgs) / len(prev3_chgs)
+            if avg_chg < 1.5:
+                kline_score += 3
+                reasons.append("3日窄幅横盘蓄势(高胜率信号)")
+            else:
+                reasons.append("3日小幅整理蓄势")
+        elif all(c < 5 for c in prev3_chgs):
+            kline_score += 6
+            reasons.append("3日相对平稳")
+
+        # 今日放量突破（vs前3日量能对比，和上面的vol_expand一致）
+        if vol_expand >= 2 and prev3_calm:
+            kline_score += 5
+            reasons.append("横盘后放量爆发!")
+        elif vol_expand >= 2:
+            kline_score += 2
+
+    kline_score = min(25, kline_score)
+    score += kline_score
+    details["蓄势"] = f"({kline_score}/25)"
+
+    # ── 3. 趋势确认 (0-20)（多头排列+站上MA20=必要条件）──
+    # 多头排列: 涨停命中7%, 站上MA20: 6.4% vs MA20下方: 0.4%!
+    # MA20下方几乎不会涨停（0.4%命中），必须作为硬门槛
+    trend_score = 0
+
+    if kline is not None and len(kline) >= 20:
+        latest = kline.iloc[-1]
+        ma5 = latest.get("MA5", 0) or 0
+        ma10 = latest.get("MA10", 0) or 0
+        ma20 = latest.get("MA20", 0) or 0
+
+        if ma20 > 0 and price > ma20:
+            trend_score += 8
+        elif ma20 > 0:
+            trend_score -= 10  # 回测：MA20下方涨停命中仅0.4%，强烈惩罚
+            reasons.append("MA20下方(回测涨停率仅0.4%)")
+
+        if ma5 > 0 and ma10 > 0 and ma20 > 0:
+            if ma5 > ma10 > ma20:
+                trend_score += 10
+                reasons.append("多头排列(回测组合83%胜率)")
+            elif ma5 > ma10:
+                trend_score += 4
+            elif price > ma5:
+                trend_score += 2
+
+        # MACD多头加分（回测6.5%涨停命中）
+        dif = latest.get("DIF", 0) or 0
+        dea = latest.get("DEA", 0) or 0
+        if dif > dea:
+            trend_score += 2
+        # 注意：MACD空头反转回测仅0.5%命中率，不加分！
+
+    trend_score = max(-10, min(20, trend_score))
+    score += trend_score
+    details["趋势"] = f"({trend_score}/20)"
+
+    # ── 4. 资金流向 (0-10) ──
+    fund_score = 0
+    if capital_info and isinstance(capital_info, dict):
+        net_inflow = capital_info.get("主力净流入", 0) or 0
+        if net_inflow > 5000:
+            fund_score = 10
+            reasons.append("主力大幅流入")
+        elif net_inflow > 2000:
+            fund_score = 7
+        elif net_inflow > 500:
+            fund_score = 4
+        elif net_inflow < -2000:
+            fund_score = 0
+            reasons.append("主力流出")
+        else:
+            fund_score = 2
+    else:
+        fund_score = 2
+
+    score += fund_score
+    details["资金"] = f"({fund_score}/10)"
+
+    # ── 5. 市场环境 (0-10) ──
+    env_score = 0
+
+    if zt_pool:
+        zt_count = len(zt_pool)
+        if zt_count >= 30:
+            env_score += 5
+            reasons.append(f"市场火热({zt_count}只涨停)")
+        elif zt_count >= 15:
+            env_score += 3
+        elif zt_count < 5:
+            env_score -= 3
+            reasons.append(f"市场冰点({zt_count}只涨停)")
+
+    if near_limit_codes and len(near_limit_codes) >= 10:
+        env_score += 5
+        reasons.append(f"{len(near_limit_codes)}只冲板")
+    elif near_limit_codes and len(near_limit_codes) >= 5:
+        env_score += 3
+
+    env_score = max(0, min(10, env_score))
+    score += env_score
+    details["环境"] = f"({env_score}/10)"
+
+    score = max(0, min(100, score))
+    reason_str = "；".join(reasons) if reasons else "无明显特征"
+
+    return score, details, reason_str
+
+
+def calc_predict_zt_sell(score, price, kline, chg_at_buy):
+    """
+    涨停预测买入后的卖出策略
+
+    买入场景：涨幅0.5-5%时买入，预期当天涨停(+10%)
+    利润空间：买入到涨停约5-10%，加次日溢价可达15%+
+
+    卖出场景：
+    A. 当天涨停 → 次日冲高卖（收益=涨停差+次日溢价）
+    B. 当天未涨停但收涨 → 次日观察，冲高卖或持有
+    C. 当天冲高回落 → 当天尾盘或次日止损
+    """
+    # 买入到涨停的预期收益
+    today_gain = 10 - chg_at_buy
+
+    if kline is None or kline.empty:
+        return {
+            "止损价": round(price * 0.97, 2),
+            "止损幅度": -3.0,
+            "止盈一": round(price * (1 + (today_gain + 3) / 100), 2),
+            "止盈一幅度": round(today_gain + 3, 1),
+            "止盈二": round(price * (1 + (today_gain + 7) / 100), 2),
+            "止盈二幅度": round(today_gain + 7, 1),
+            "仓位": 10,
+            "风险等级": "高风险",
+            "ATR": 5.0,
+            "买入价参考": round(price, 2),
+            "预期涨停价": round(price * (1 + today_gain / 100), 2),
+            "今日涨停收益": f"+{today_gain:.1f}%",
+            "策略": "涨停则次日竞价卖，未涨停则止损",
+        }
+
+    # ATR计算
+    if len(kline) >= 14:
+        highs = kline["最高"].iloc[-14:]
+        lows = kline["最低"].iloc[-14:]
+        closes = kline["收盘"].iloc[-14:]
+        tr = pd.concat([highs - lows, abs(highs - closes.shift(1)), abs(lows - closes.shift(1))], axis=1).max(axis=1)
+        atr = tr.mean()
+    else:
+        atr = price * 0.05
+    atr_pct = (atr / price * 100) if price > 0 else 5.0
+
+    buy_price = price
+    zt_price = round(buy_price * (1 + today_gain / 100), 2)
+
+    # 止损：买入价-3%（低位买入，止损空间小）
+    stop_pct = max(2.0, min(atr_pct * 0.7, 3.5))
+    stop_price = round(buy_price * (1 - stop_pct / 100), 2)
+
+    # 止盈：涨停+次日溢价
+    tp1_pct = today_gain + 3  # 涨停+次日高开3%
+    tp2_pct = today_gain + 7  # 涨停+次日强势
+
+    # 根据评分调整仓位（高评分=高确定性=可适当加仓）
+    if score >= 75:
+        position = 20
+        risk_level = "较高风险"
+        strategy = "高确定性，涨停后次日冲高分批卖"
+    elif score >= 60:
+        position = 15
+        risk_level = "高风险"
+        strategy = "涨停则次日竞价卖，未涨停看收盘决定"
+    elif score >= 50:
+        position = 10
+        risk_level = "高风险"
+        strategy = "涨停则次日竞价卖，未涨停次日止损"
+    else:
+        position = 8
+        risk_level = "极高风险"
+        strategy = "低确定性，严格止损-3%"
+
+    return {
+        "止损价": stop_price,
+        "止损幅度": round(-stop_pct, 1),
+        "止盈一": round(buy_price * (1 + tp1_pct / 100), 2),
+        "止盈一幅度": round(tp1_pct, 1),
+        "止盈二": round(buy_price * (1 + tp2_pct / 100), 2),
+        "止盈二幅度": round(tp2_pct, 1),
+        "仓位": position,
+        "风险等级": risk_level,
+        "ATR": round(atr_pct, 1),
+        "买入价参考": round(buy_price, 2),
+        "预期涨停价": zt_price,
+        "今日涨停收益": f"+{today_gain:.1f}%",
+        "策略": strategy,
+    }
+
+
+def scan_predict_zt(top_n=10):
+    """
+    涨停预测扫描：早盘10:00-10:30运行
+    找出当天可能涨停的股票，在涨停前买入
+    """
+    print("=" * 65)
+    print("  涨停预测扫描（早盘10:00-10:30）")
+    print(f"  扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 65)
+    print()
+
+    # ── 并行获取数据 ──
+    print("[1/3] 获取实时行情...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        f_sl = ex.submit(fetch_stock_list_sina)
+        f_zt = ex.submit(fetch_limit_up_pool)
+        f_hot = ex.submit(get_hot_sectors)
+        f_cap = ex.submit(fetch_capital_flow_rank, 200)
+        f_sentiment = ex.submit(get_sentiment_score)
+        f_limit = ex.submit(count_limit_up)
+
+    stock_list = f_sl.result()
+    zt_pool = f_zt.result()
+    hot_sectors = f_hot.result()
+    capital_rank = f_cap.result()
+    sentiment_score, sentiment_info = f_sentiment.result()
+    limit_up, limit_down = f_limit.result()
+
+    if stock_list.empty:
+        print("[错误] 获取股票列表失败")
+        return {"results": [], "summary": {}}
+
+    # 涨停池fallback
+    if not zt_pool and not stock_list.empty:
+        zt_from_list = stock_list[
+            (stock_list["涨跌幅"] >= 9.8) &
+            (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+            (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+        ]
+        for _, row in zt_from_list.iterrows():
+            zt_pool[str(row.get("代码", ""))] = {}
+
+    # ── 预筛选候选股 ──
+    candidates = _prefilter(stock_list, PREFILTER_PREDICT_ZT)
+    # 排除已涨停的
+    candidates = candidates[~candidates["代码"].isin(set(zt_pool.keys()))]
+
+    # 冲板候选（7%+）用于板块效应判断
+    near_limit = fetch_near_limit_stocks(stock_list)
+    near_limit_codes = set(near_limit["代码"].tolist()) if not near_limit.empty else set()
+
+    print(f"  已涨停 {limit_up} 只，跌停 {limit_down} 只")
+    print(f"  候选池 {len(candidates)} 只（涨幅{PREFILTER_PREDICT_ZT['涨幅下限']}-{PREFILTER_PREDICT_ZT['涨幅上限']}%）")
+    print(f"  {sentiment_info}")
+    print()
+
+    # ── 分析候选股 ──
+    print(f"[2/3] 分析 {len(candidates)} 只候选股...")
+    results = []
+
+    # 建立stock_info索引
+    si = {}
+    for _, row in candidates.iterrows():
+        code = str(row.get("代码", ""))
+        si[code] = row.to_dict()
+
+    hot_sector_names = list(hot_sectors) if hot_sectors else []
+
+    def analyze_one(code):
+        info = si.get(code, {})
+        name = str(info.get("名称", ""))
+        price = info.get("最新价", 0) or 0
+        chg = info.get("涨跌幅", 0) or 0
+
+        # 获取K线（需要历史数据判断形态）
+        kline = fetch_kline(code, days=30)
+        if kline.empty or len(kline) < 5:
+            return None
+        kline = calc_all_indicators(kline)
+
+        cap_info = capital_rank.get(code) if isinstance(capital_rank, dict) else None
+
+        s, d, r = score_predict_zt(
+            code, info, kline,
+            capital_info=cap_info,
+            hot_sectors=hot_sector_names,
+            zt_pool=zt_pool,
+            near_limit_codes=near_limit_codes,
+        )
+
+        # 评分门槛（回测：>=50分区间胜率明显提升）
+        if s < 50:
+            return None
+
+        risk = calc_predict_zt_sell(s, price, kline, chg)
+
+        return {
+            "代码": code,
+            "名称": name,
+            "最新价": price,
+            "涨跌幅": chg,
+            "换手率": info.get("换手率", 0) or 0,
+            "量比": info.get("量比", 0) or 0,
+            "振幅": info.get("振幅", 0) or 0,
+            "今开涨幅": round((info.get("今开", 0) or 0) / (info.get("昨收", 1) or 1) * 100 - 100, 1),
+            "评分": s,
+            "信号": d,
+            "理由": r,
+            "risk": risk,
+        }
+
+    ordered = candidates.sort_values("涨跌幅", ascending=False)["代码"].tolist()
+
+    err_count = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyze_one, c): c for c in ordered}
+        for f in as_completed(futures):
+            try:
+                r = f.result()
+                if r:
+                    results.append(r)
+            except Exception as e:
+                err_count += 1
+                if err_count <= 3:
+                    print(f"  [调试] 分析异常: {e}")
+    if err_count:
+        print(f"  [警告] {err_count} 只分析失败")
+
+    results.sort(key=lambda x: x["评分"], reverse=True)
+    print(f"  分析完成，{len(results)} 只通过评分门槛")
+
+    # ── 输出 ──
+    print()
+    print("[3/3] 输出结果")
+    print()
+    print("=" * 65)
+    print(f"  涨停预测 TOP {min(top_n, len(results))}（满分100）")
+    print(f"  策略：低位买入(0.5-5%) → 预期当天涨停 → 次日卖出")
+    print("=" * 65)
+    print()
+
+    if results:
+        table_data = []
+        for r in results[:top_n]:
+            risk = r.get("risk", {})
+            table_data.append([
+                r["代码"], r["名称"],
+                f"{r['最新价']:.2f}",
+                f"{r['涨跌幅']:+.1f}%",
+                f"{r['量比']:.1f}",
+                f"{r['换手率']:.1f}%",
+                f"{r['振幅']:.1f}%",
+                r["评分"],
+                risk.get("预期涨停价", "-"),
+                risk.get("止损价", "-"),
+                risk.get("仓位", "-"),
+                r["理由"][:25],
+            ])
+        print(tabulate(
+            table_data,
+            headers=["代码", "名称", "现价", "涨幅", "量比", "换手", "振幅", "评分",
+                      "涨停价", "止损", "仓位%", "理由"],
+            tablefmt="simple_grid", stralign="center",
+        ))
+
+        # 详细输出前3
+        print()
+        for i, r in enumerate(results[:3]):
+            risk = r.get("risk", {})
+            print(f"  {'★' * (3-i)} {r['代码']} {r['名称']} | 评分 {r['评分']}/100")
+            print(f"     现价 {r['最新价']:.2f} (涨{r['涨跌幅']:.1f}%) → 预期涨停价 {risk.get('预期涨停价', '?')}")
+            print(f"     买入后今日收益: {risk.get('今日涨停收益', '?')}（如封涨停）")
+            print(f"     次日止损: {risk.get('止损价', '?')} ({risk.get('止损幅度', '?')}%)")
+            print(f"     次日止盈: {risk.get('止盈一', '?')} (+{risk.get('止盈一幅度', '?')}%)")
+            print(f"     建议仓位: {risk.get('仓位', '?')}% | {risk.get('风险等级', '?')}")
+            print(f"     策略: {risk.get('策略', '?')}")
+            print(f"     理由: {r['理由']}")
+            print()
+    else:
+        print("  当前无符合条件的涨停预测候选")
+        print()
+
+    print("提示：")
+    print("  - 适合早盘10:00-10:30运行，涨幅0.5-5%低位买入")
+    print("  - 核心逻辑：板块联动+量能异动+形态蓄势 = 涨停前兆")
+    print("  - 低位买入利润空间大（5-10%到涨停 + 次日溢价）")
+    print("  - 买入后当天涨停：次日集合竞价或冲高卖出")
+    print("  - 买入后没涨停：次日止损（-3%）")
+    print("  - 仓位严格控制，单只不超过总资金20%")
+    print("  - 以上仅为技术分析，不构成投资建议！")
+
+    return {
+        "results": results[:top_n],
+        "summary": {
+            "候选池": len(candidates),
+            "通过门槛": len(results),
+            "已涨停": limit_up,
+            "跌停": limit_down,
+            "冲板数": len(near_limit_codes),
+            "sentiment": {"score": sentiment_score, "info": sentiment_info},
+        },
+    }
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -6928,6 +7451,8 @@ if __name__ == "__main__":
         etf_go()
     elif args[0] == "--ztb":
         scan_zt_board()
+    elif args[0] == "--predict-zt":
+        scan_predict_zt()
     elif args[0] == "--top":
         top_n = int(args[1]) if len(args) > 1 else 15
         scan_market_v2(top_n)

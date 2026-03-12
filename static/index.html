@@ -247,6 +247,20 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div id="ztb-results"></div>
 </div>
 
+<!-- 涨停预测 -->
+<div id="p-predict" class="page">
+  <div style="padding-top:28vh;text-align:center" id="predict-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">涨停预测：早盘10:00-10:30，低位精选涨停候选</div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:12px">策略：涨幅0.5-5%低位买入 → 当天封涨停 → 次日卖出</div>
+    <button class="btn btn-primary" id="btn-predict" onclick="startPredict()" style="max-width:280px;margin:0 auto;font-size:17px;padding:16px;border-radius:14px;background:#e040fb">涨停预测扫描</button>
+  </div>
+  <div id="predict-progress" style="display:none">
+    <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="predict-msg">准备中...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="predict-bar"></div></div>
+  </div>
+  <div id="predict-results"></div>
+</div>
+
 <!-- 板块 -->
 <div id="p-sector" class="page">
   <div class="sector-toggle">
@@ -297,6 +311,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div class="tab" onclick="switchTab('go5',this)"><span class="icon">&#128293;</span>波段</div>
   <div class="tab" onclick="switchTab('etf',this)"><span class="icon">&#128176;</span>ETF</div>
   <div class="tab" onclick="switchTab('ztb',this)"><span class="icon">&#9889;</span>涨停</div>
+  <div class="tab" onclick="switchTab('predict',this)"><span class="icon">&#127775;</span>预测</div>
   <div class="tab" onclick="switchTab('sector',this)"><span class="icon">&#128200;</span>板块</div>
   <div class="tab" onclick="switchTab('stock',this)"><span class="icon">&#128269;</span>个股</div>
   <div class="tab" onclick="switchTab('sim',this)"><span class="icon">&#128202;</span>回测</div>
@@ -357,7 +372,7 @@ function switchTab(name, el) {
   $$('.tab').forEach(t => t.classList.remove('active'));
   $(`#p-${name}`).classList.add('active');
   if (el) el.classList.add('active');
-  else { const idx = ['market','scan','go','go5','etf','ztb','sector','stock','sim','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
+  else { const idx = ['market','scan','go','go5','etf','ztb','predict','sector','stock','sim','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
   currentTab = name;
   localStorage.setItem('tab', name);
   if (name === 'market' && !marketLoaded) loadMarket();
@@ -1163,6 +1178,240 @@ function renderZtbResults(data) {
   warnContent.appendChild(warnText);
   warnContent.style.whiteSpace = 'pre-line';
   warnCard.appendChild(warnContent);
+  container.appendChild(warnCard);
+}
+
+// ── 涨停预测 ──
+function startPredict() {
+  $('#btn-predict').disabled = true;
+  $('#predict-btn-wrap').style.paddingTop = '16px';
+  $('#predict-progress').style.display = 'block';
+  $('#predict-results').textContent = '';
+  sseConnect('/api/predict-zt', (d, es) => {
+    if (d.type === 'progress') {
+      $('#predict-msg').textContent = d.msg;
+      $('#predict-bar').style.width = (d.pct || 0) + '%';
+    } else if (d.type === 'error') {
+      toast(d.msg); es.close(); $('#btn-predict').disabled = false;
+    } else if (d.type === 'result') {
+      es.close(); $('#btn-predict').disabled = false;
+      $('#predict-progress').style.display = 'none';
+      renderPredictResults(d.data);
+    }
+  }, () => { $('#btn-predict').disabled = false; });
+}
+
+function renderPredictResults(data) {
+  const results = data.results || [];
+  const sm = data.summary || {};
+  const container = $('#predict-results');
+  container.textContent = '';
+
+  // 概览
+  const overviewCard = document.createElement('div');
+  overviewCard.className = 'card';
+  const overviewTitle = document.createElement('div');
+  overviewTitle.className = 'card-title';
+  overviewTitle.textContent = '涨停预测概览';
+  overviewCard.appendChild(overviewTitle);
+  const overviewGrid = document.createElement('div');
+  overviewGrid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px';
+  const smt = sm.sentiment || {};
+  [
+    ['候选池', (sm['候选池']||0) + ' 只', ''],
+    ['通过门槛', (sm['通过门槛']||0) + ' 只', 'up'],
+    ['已涨停', (sm['已涨停']||0) + ' 只', 'up'],
+    ['跌停', (sm['跌停']||0) + ' 只', 'down'],
+    ['冲板中', (sm['冲板数']||0) + ' 只', ''],
+    ['情绪', (smt.score||0) + '分', (smt.score||0)>=60?'up':'down'],
+  ].forEach(([label, val, cls]) => {
+    const d = document.createElement('div');
+    d.textContent = label + ': ';
+    const b = document.createElement('b');
+    if (cls) b.className = cls;
+    b.textContent = val;
+    d.appendChild(b);
+    overviewGrid.appendChild(d);
+  });
+  overviewCard.appendChild(overviewGrid);
+  container.appendChild(overviewCard);
+
+  // 候选列表
+  if (results.length) {
+    const listCard = document.createElement('div');
+    listCard.className = 'card';
+    const listTitle = document.createElement('div');
+    listTitle.className = 'card-title';
+    listTitle.style.color = '#e040fb';
+    listTitle.textContent = '涨停预测候选 TOP ' + results.length;
+    listCard.appendChild(listTitle);
+
+    results.forEach(s => {
+      const scColor = s['评分'] >= 70 ? 'up' : s['评分'] >= 55 ? '' : 'down';
+      const item = document.createElement('div');
+      item.className = 'stock-item';
+      item.onclick = () => goStock(s['代码']);
+
+      const info = document.createElement('div');
+      info.className = 'stock-info';
+      const nameDiv = document.createElement('div');
+      nameDiv.className = 'stock-name';
+      nameDiv.textContent = s['名称'];
+      info.appendChild(nameDiv);
+
+      const codeDiv = document.createElement('div');
+      codeDiv.className = 'stock-code';
+      codeDiv.textContent = s['代码'] + ' | 量比' + (s['量比']||0).toFixed(1) + ' | 换手' + (s['换手率']||0).toFixed(1) + '%';
+      info.appendChild(codeDiv);
+
+      const reasonDiv = document.createElement('div');
+      reasonDiv.style.cssText = 'font-size:11px;color:var(--text2);margin-top:2px';
+      reasonDiv.textContent = (s['理由']||'').substring(0, 40);
+      info.appendChild(reasonDiv);
+      item.appendChild(info);
+
+      const priceDiv = document.createElement('div');
+      priceDiv.className = 'stock-price';
+      const priceNum = document.createElement('div');
+      priceNum.style.cssText = 'font-size:15px;font-weight:600';
+      priceNum.className = 'up';
+      priceNum.textContent = (s['最新价']||0).toFixed(2);
+      priceDiv.appendChild(priceNum);
+      const chgDiv = document.createElement('div');
+      chgDiv.style.fontSize = '12px';
+      chgDiv.className = 'up';
+      chgDiv.textContent = '+' + (s['涨跌幅']||0).toFixed(1) + '%';
+      priceDiv.appendChild(chgDiv);
+      item.appendChild(priceDiv);
+
+      const scoreDiv = document.createElement('div');
+      scoreDiv.className = 'stock-score ' + scColor;
+      scoreDiv.textContent = s['评分'];
+      item.appendChild(scoreDiv);
+      listCard.appendChild(item);
+    });
+    container.appendChild(listCard);
+
+    // 详细卡片（前3只）
+    results.slice(0, 3).forEach(s => {
+      const rk = s.risk || {};
+      const card = document.createElement('div');
+      card.className = 'go-stock';
+      card.style.borderColor = '#e040fb';
+
+      const header = document.createElement('div');
+      header.className = 'go-stock-header';
+      const headerLeft = document.createElement('div');
+      const hName = document.createElement('div');
+      hName.className = 'go-stock-name';
+      hName.textContent = s['名称'] + '(' + s['代码'] + ')';
+      headerLeft.appendChild(hName);
+      const hSub = document.createElement('div');
+      hSub.style.cssText = 'font-size:12px;color:var(--text2)';
+      hSub.textContent = '涨' + (s['涨跌幅']||0).toFixed(1) + '% | 预期涨停收益' + (rk['今日涨停收益']||'?') + ' | ' + (rk['策略']||'');
+      headerLeft.appendChild(hSub);
+      header.appendChild(headerLeft);
+      const hScore = document.createElement('div');
+      hScore.className = 'go-stock-score';
+      hScore.style.color = '#e040fb';
+      hScore.textContent = s['评分'] + '/100';
+      header.appendChild(hScore);
+      card.appendChild(header);
+
+      const reasonLine = document.createElement('div');
+      reasonLine.style.cssText = 'font-size:12px;margin-top:4px;color:#e040fb';
+      reasonLine.textContent = '预测理由: ' + (s['理由']||'');
+      card.appendChild(reasonLine);
+
+      // 风控区
+      const riskSec = document.createElement('div');
+      riskSec.className = 'go-section';
+      const riskTitle = document.createElement('div');
+      riskTitle.className = 'go-section-title';
+      riskTitle.style.borderColor = '#e040fb';
+      riskTitle.textContent = '交易计划 (' + (rk['风险等级']||'') + ')';
+      riskSec.appendChild(riskTitle);
+      [
+        ['买入参考价', (rk['买入价参考']||0).toFixed(2), ''],
+        ['预期涨停价', (rk['预期涨停价']||0).toFixed(2) + ' (封板收益' + (rk['今日涨停收益']||'?') + ')', 'up'],
+        ['建议仓位', (rk['仓位']||0) + '%', ''],
+        ['次日止损', (rk['止损价']||0).toFixed(2) + ' (' + (rk['止损幅度']||0).toFixed(1) + '%)', 'down'],
+        ['次日目标一', (rk['止盈一']||0).toFixed(2) + ' (+' + (rk['止盈一幅度']||0).toFixed(1) + '%)', 'up'],
+        ['次日目标二', (rk['止盈二']||0).toFixed(2) + ' (+' + (rk['止盈二幅度']||0).toFixed(1) + '%)', 'up'],
+      ].forEach(([label, val, cls]) => {
+        const row = document.createElement('div');
+        row.className = 'risk-row';
+        const lbl = document.createElement('span');
+        lbl.className = 'risk-label';
+        lbl.textContent = label;
+        row.appendChild(lbl);
+        const vl = document.createElement('span');
+        vl.className = 'risk-val' + (cls ? ' ' + cls : '');
+        vl.textContent = val;
+        row.appendChild(vl);
+        riskSec.appendChild(row);
+      });
+      card.appendChild(riskSec);
+
+      // 操作时间线
+      const planSec = document.createElement('div');
+      planSec.className = 'go-section';
+      const planTitle = document.createElement('div');
+      planTitle.className = 'go-section-title';
+      planTitle.style.borderColor = '#e040fb';
+      planTitle.textContent = '操作计划';
+      planSec.appendChild(planTitle);
+      const timeline = document.createElement('div');
+      timeline.className = 'timeline';
+      [
+        '10:00-10:30 买入：现价' + (s['最新价']||0).toFixed(2) + '附近挂单',
+        '10:30-11:30 观察：封涨停则持有过夜',
+        '13:00-14:30 未涨停：看收盘形态决定是否持有',
+        '14:50 仍未涨停且涨幅<5%：考虑尾盘卖出',
+        '次日09:15 集合竞价：若涨停过夜，高开3%+挂卖',
+        '次日09:30 冲高卖出：涨停股次日溢价窗口',
+        '次日止损线 ' + (rk['止损价']||0).toFixed(2) + ' 跌破必卖',
+      ].forEach(text => {
+        const ti = document.createElement('div');
+        ti.className = 'timeline-item';
+        ti.textContent = text;
+        timeline.appendChild(ti);
+      });
+      planSec.appendChild(timeline);
+      card.appendChild(planSec);
+      container.appendChild(card);
+    });
+  } else {
+    const emptyCard = document.createElement('div');
+    emptyCard.className = 'card';
+    emptyCard.style.cssText = 'text-align:center;padding:40px 20px;color:var(--text2)';
+    emptyCard.textContent = '当前无符合条件的涨停预测候选（建议10:00-10:30运行）';
+    container.appendChild(emptyCard);
+  }
+
+  // 警告
+  const warnCard = document.createElement('div');
+  warnCard.className = 'card';
+  warnCard.style.cssText = 'background:rgba(224,64,251,0.08);border:1px solid rgba(224,64,251,0.2)';
+  const warnTitle = document.createElement('b');
+  warnTitle.style.color = '#e040fb';
+  warnTitle.textContent = '涨停预测策略说明';
+  warnCard.appendChild(warnTitle);
+  const warnList = document.createElement('div');
+  warnList.style.cssText = 'font-size:12px;color:var(--text2);line-height:1.6;margin-top:4px';
+  ['1. 适合早盘10:00-10:30运行，低位精选涨幅0.5-5%的股',
+   '2. 核心：板块联动+量能异动+形态蓄势 = 涨停前兆',
+   '3. 低位买入利润空间大（5-10%到涨停+次日溢价）',
+   '4. 涨停成功：次日集合竞价或冲高卖出',
+   '5. 没涨停：次日止损（-3%）',
+   '6. 仓位严格控制，单只不超过总资金20%',
+   '7. 以上仅为技术分析，不构成投资建议！',
+  ].forEach(text => {
+    const p = document.createElement('div');
+    p.textContent = text;
+    warnList.appendChild(p);
+  });
+  warnCard.appendChild(warnList);
   container.appendChild(warnCard);
 }
 

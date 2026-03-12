@@ -1240,6 +1240,139 @@ def api_ztb():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── API: 涨停预测 (SSE) ──
+
+@app.get("/api/predict-zt")
+def api_predict_zt():
+    def generate():
+        try:
+            yield sse({"type": "progress", "msg": "获取实时行情...", "pct": 5})
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                f_sl = ex.submit(t1.fetch_stock_list_sina)
+                f_zt = ex.submit(t1.fetch_limit_up_pool)
+                f_hot = ex.submit(t1.get_hot_sectors)
+                f_cap = ex.submit(t1.fetch_capital_flow_rank, 200)
+                f_sentiment = ex.submit(t1.get_sentiment_score)
+                f_limit = ex.submit(t1.count_limit_up)
+
+            stock_list = f_sl.result()
+            zt_pool = f_zt.result()
+            hot_sectors = f_hot.result()
+            capital_rank = f_cap.result()
+            sentiment_score, sentiment_info = f_sentiment.result()
+            limit_up, limit_down = f_limit.result()
+
+            if stock_list.empty:
+                yield sse({"type": "error", "msg": "获取股票列表失败"})
+                return
+
+            # 涨停池fallback
+            if not zt_pool and not stock_list.empty:
+                zt_from_list = stock_list[
+                    (stock_list["涨跌幅"] >= 9.8) &
+                    (stock_list["最新价"] >= 3) & (stock_list["最新价"] <= 100) &
+                    (~stock_list["名称"].str.contains("ST|退市|N |C ", na=False))
+                ]
+                for _, row in zt_from_list.iterrows():
+                    zt_pool[str(row.get("代码", ""))] = {}
+
+            yield sse({"type": "progress", "msg": "筛选候选股...", "pct": 20})
+
+            # 预筛选
+            candidates = t1._prefilter(stock_list, t1.PREFILTER_PREDICT_ZT)
+            candidates = candidates[~candidates["代码"].isin(set(zt_pool.keys()))]
+
+            near_limit = t1.fetch_near_limit_stocks(stock_list)
+            near_limit_codes = set(near_limit["代码"].tolist()) if not near_limit.empty else set()
+
+            hot_sector_names = list(hot_sectors) if hot_sectors else []
+
+            si = {}
+            for _, row in candidates.iterrows():
+                si[str(row.get("代码", ""))] = row.to_dict()
+
+            yield sse({"type": "progress", "msg": f"分析 {len(candidates)} 只候选股...", "pct": 30})
+
+            results = []
+            done = [0]
+            total = len(candidates)
+
+            def analyze_one(code):
+                info = si.get(code, {})
+                name = str(info.get("名称", ""))
+                price = info.get("最新价", 0) or 0
+                chg = info.get("涨跌幅", 0) or 0
+
+                kline = t1.fetch_kline(code, days=30)
+                if kline.empty or len(kline) < 5:
+                    return None
+                kline = t1.calc_all_indicators(kline)
+
+                cap_info = capital_rank.get(code) if isinstance(capital_rank, dict) else None
+
+                s, d, r = t1.score_predict_zt(
+                    code, info, kline,
+                    capital_info=cap_info,
+                    hot_sectors=hot_sector_names,
+                    zt_pool=zt_pool,
+                    near_limit_codes=near_limit_codes,
+                )
+
+                if s < 50:
+                    return None
+
+                risk = t1.calc_predict_zt_sell(s, price, kline, chg)
+
+                return {
+                    "代码": code, "名称": name, "最新价": price,
+                    "涨跌幅": chg,
+                    "换手率": info.get("换手率", 0) or 0,
+                    "量比": info.get("量比", 0) or 0,
+                    "振幅": info.get("振幅", 0) or 0,
+                    "今开涨幅": round((info.get("今开", 0) or 0) / (info.get("昨收", 1) or 1) * 100 - 100, 1),
+                    "评分": s, "信号": d, "理由": r, "risk": risk,
+                }
+
+            ordered = candidates.sort_values("涨跌幅", ascending=False)["代码"].tolist()
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                futures = {executor.submit(analyze_one, c): c for c in ordered}
+                for f in as_completed(futures):
+                    done[0] += 1
+                    try:
+                        r = f.result()
+                        if r:
+                            results.append(r)
+                    except Exception:
+                        pass
+                    if done[0] % 20 == 0 and total > 0:
+                        pct = 30 + int(done[0] / total * 50)
+                        yield sse({"type": "progress",
+                                   "msg": f"涨停预测分析 {done[0]}/{total}",
+                                   "pct": min(pct, 80)})
+
+            results.sort(key=lambda x: x["评分"], reverse=True)
+
+            yield sse({"type": "result", "data": {
+                "results": results[:15],
+                "summary": {
+                    "候选池": len(candidates),
+                    "通过门槛": len(results),
+                    "已涨停": limit_up,
+                    "跌停": limit_down,
+                    "冲板数": len(near_limit_codes),
+                    "sentiment": {"score": sentiment_score, "info": sentiment_info},
+                },
+            }})
+
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 # ── API: 模拟实盘回测 (SSE) ──
 
 @app.get("/api/simulate")

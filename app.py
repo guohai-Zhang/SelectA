@@ -566,8 +566,8 @@ def api_go():
                     rec_level = "推荐"
                 elif total_score >= go_th:
                     rec_level = "弱推荐"
-                elif total_score >= go_th * 0.7:
-                    rec_level = "弱推荐"
+                elif total_score >= go_th * 0.8 and "C级" not in sig_q:
+                    rec_level = "观望"
                 else:
                     rec_level = "仅参考"
                 latest = kl.iloc[-1]
@@ -1016,6 +1016,254 @@ def api_etf():
                     "hot_sectors": all_hot[:6],
                     "money_effect": money_effect,
                 },
+            }})
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── API: 模拟实盘回测 (SSE) ──
+
+@app.get("/api/simulate")
+def api_simulate():
+    def generate():
+        import re as _re
+        try:
+            cal_weights, cal_threshold, cal_combos = t1.load_calibrated_weights()
+            bt_threshold = cal_threshold if cal_weights else 110
+
+            yield sse({"type": "progress", "msg": "获取股票列表...", "pct": 2})
+            stock_list = t1.fetch_stock_list_sina()
+            if stock_list.empty:
+                yield sse({"type": "error", "msg": "无法获取股票列表"})
+                return
+
+            sample_size = 200
+            active = stock_list[(stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 80) &
+                                (stock_list["换手率"] >= 1)]
+            if len(active) < sample_size:
+                active = stock_list.head(sample_size)
+            codes = active.sample(min(sample_size, len(active)), random_state=42)["代码"].tolist()
+
+            yield sse({"type": "progress", "msg": f"获取 {len(codes)} 只股票K线...", "pct": 5})
+
+            # 批量获取K线
+            all_klines = {}
+            for i, c in enumerate(codes):
+                kline = t1.fetch_kline_long(c, days=250)
+                if kline.empty or len(kline) < 60:
+                    continue
+                kline = t1.calc_all_indicators(kline)
+                all_klines[c] = kline
+                if (i + 1) % 40 == 0:
+                    pct = 5 + int(i / len(codes) * 40)
+                    yield sse({"type": "progress",
+                               "msg": f"K线 {i+1}/{len(codes)}，有效 {len(all_klines)} 只",
+                               "pct": pct})
+                import time as _time
+                _time.sleep(0.1)
+
+            if not all_klines:
+                yield sse({"type": "error", "msg": "无法获取K线数据"})
+                return
+
+            # 收集所有日期
+            all_dates = set()
+            for kline in all_klines.values():
+                all_dates.update(kline["日期"].tolist())
+            all_dates = sorted(all_dates)[-250:]
+
+            cap_sim = {"主力净流入占比": 3, "主力净流入": 1e7,
+                       "超大单净流入": 0, "超大单占比": 0, "大单净流入": 0, "大单占比": 0}
+
+            yield sse({"type": "progress", "msg": f"逐日评分 {len(all_dates)} 个交易日...", "pct": 50})
+
+            # 逐日选TOP1
+            trades = []
+            no_signal_days = 0
+            monthly_stats = {}
+
+            for di, date in enumerate(all_dates):
+                if (di + 1) % 50 == 0:
+                    pct = 50 + int(di / len(all_dates) * 40)
+                    yield sse({"type": "progress",
+                               "msg": f"评分 {di+1}/{len(all_dates)}，已选 {len(trades)} 笔",
+                               "pct": pct})
+
+                best_code = None
+                best_score = -999
+                best_details = {}
+                best_pos = 0
+                best_kline = None
+
+                for code, kline in all_klines.items():
+                    date_mask = kline["日期"] == date
+                    if not date_mask.any():
+                        continue
+                    idx = kline.index[date_mask][-1]
+                    pos = kline.index.get_loc(idx)
+                    if pos < 30 or pos >= len(kline) - 1:
+                        continue
+                    window = kline.iloc[:pos+1].copy()
+                    sc, details, _ = t1.evaluate_signals_v2(
+                        window, cap_sim, 8, 8, 25, {},
+                        calibrated_weights=cal_weights, golden_combos=cal_combos)
+                    if sc > best_score:
+                        best_score = sc
+                        best_code = code
+                        best_details = details
+                        best_pos = pos
+                        best_kline = kline
+
+                if best_score < bt_threshold or best_code is None:
+                    no_signal_days += 1
+                    continue
+
+                buy_price = float(best_kline.iloc[best_pos]["收盘"])
+                sell_price = float(best_kline.iloc[best_pos + 1]["收盘"])
+                pnl = (sell_price - buy_price) / buy_price * 100
+
+                sig_q = best_details.get("信号质量", "C级")
+                has_combo = best_details.get("黄金组合匹配", False)
+                hq_match = _re.search(r"(\d+)个高胜率", sig_q)
+                high_count = int(hq_match.group(1)) if hq_match else 0
+
+                row = best_kline.iloc[best_pos]
+                today_chg = float(row.get("涨跌幅", 0))
+                amplitude = float((row["最高"] - row["最低"]) / row["最低"] * 100) if row["最低"] > 0 else 0
+                start = max(0, best_pos - 2)
+                cum_3d = float((best_kline.iloc[best_pos]["收盘"] / best_kline.iloc[start]["收盘"] - 1) * 100)
+
+                trades.append({
+                    "日期": date, "代码": best_code, "评分": round(best_score, 1),
+                    "买入价": round(buy_price, 2), "卖出价": round(sell_price, 2),
+                    "收益率": round(pnl, 2), "信号质量": sig_q, "黄金组合": has_combo,
+                    "高胜率数": high_count, "当日涨幅": round(today_chg, 2),
+                    "振幅": round(amplitude, 2), "近3日涨幅": round(cum_3d, 2),
+                })
+
+                month_key = date[:7]
+                if month_key not in monthly_stats:
+                    monthly_stats[month_key] = {"wins": 0, "total": 0, "returns": []}
+                monthly_stats[month_key]["total"] += 1
+                if pnl > 0:
+                    monthly_stats[month_key]["wins"] += 1
+                monthly_stats[month_key]["returns"].append(pnl)
+
+            yield sse({"type": "progress", "msg": "统计分析...", "pct": 95})
+
+            if not trades:
+                yield sse({"type": "error", "msg": "回测期间无达标信号"})
+                return
+
+            # 统计
+            df = pd.DataFrame(trades)
+            total = len(df)
+            wins = int(len(df[df["收益率"] > 0]))
+            losses = total - wins
+            win_rate = wins / total * 100
+            avg_ret = float(df["收益率"].mean())
+            avg_win = float(df[df["收益率"] > 0]["收益率"].mean()) if wins > 0 else 0
+            avg_loss = float(df[df["收益率"] <= 0]["收益率"].mean()) if losses > 0 else 0
+
+            df["止损收益"] = df["收益率"].clip(lower=-2)
+            stop_avg = float(df["止损收益"].mean())
+
+            df["累计"] = (1 + df["收益率"] / 100).cumprod()
+            final_return = float((df["累计"].iloc[-1] - 1) * 100)
+            cummax = df["累计"].cummax()
+            max_dd = float(((df["累计"] - cummax) / cummax * 100).min())
+
+            # 连胜连亏
+            max_ws = max_ls = cur = 0
+            for r in df["收益率"]:
+                if r <= 0:
+                    cur += 1
+                    max_ls = max(max_ls, cur)
+                else:
+                    cur = 0
+            cur = 0
+            for r in df["收益率"]:
+                if r > 0:
+                    cur += 1
+                    max_ws = max(max_ws, cur)
+                else:
+                    cur = 0
+
+            # 策略优化扫描
+            def _wr(sub):
+                if len(sub) == 0:
+                    return {"n": 0, "wr": 0, "avg": 0}
+                w = int(len(sub[sub["收益率"] > 0]))
+                return {"n": len(sub), "wr": round(w / len(sub) * 100, 1),
+                        "avg": round(float(sub["收益率"].mean()), 2)}
+
+            strategies = []
+            base = _wr(df)
+            strategies.append({"name": "基准(无过滤)", **base, "delta": "-"})
+
+            filters = [
+                ("评分>=135", df[df["评分"] >= 135]),
+                ("评分>=140", df[df["评分"] >= 140]),
+                ("评分>=145", df[df["评分"] >= 145]),
+                ("高胜率>=5", df[df["高胜率数"] >= 5]),
+                ("高胜率>=6", df[df["高胜率数"] >= 6]),
+                ("高胜率>=7", df[df["高胜率数"] >= 7]),
+                ("涨幅<=3%", df[df["当日涨幅"] <= 3]),
+                ("当日下跌才买", df[df["当日涨幅"] <= 0]),
+                ("当日上涨才买", df[df["当日涨幅"] > 0]),
+                ("振幅<=5%", df[df["振幅"] <= 5]),
+                ("近3日<=5%", df[df["近3日涨幅"] <= 5]),
+                ("评分>=135+高胜率>=6", df[(df["评分"] >= 135) & (df["高胜率数"] >= 6)]),
+                ("高胜率>=6+涨幅<=3%", df[(df["高胜率数"] >= 6) & (df["当日涨幅"] <= 3)]),
+                ("高胜率>=6+振幅<=5%+3日<=5%",
+                 df[(df["高胜率数"] >= 6) & (df["振幅"] <= 5) & (df["近3日涨幅"] <= 5)]),
+            ]
+            for name, sub in filters:
+                s = _wr(sub)
+                s["name"] = name
+                s["delta"] = round(s["wr"] - base["wr"], 1) if s["n"] > 0 else 0
+                strategies.append(s)
+
+            # 月度
+            month_list = []
+            for m in sorted(monthly_stats.keys()):
+                ms = monthly_stats[m]
+                mwr = round(ms["wins"] / ms["total"] * 100) if ms["total"] > 0 else 0
+                mavg = round(float(np.mean(ms["returns"])), 2)
+                mcum = round(float((np.prod([1 + r/100 for r in ms["returns"]]) - 1) * 100), 1)
+                month_list.append({"month": m, "n": ms["total"], "wr": mwr, "avg": mavg, "cum": mcum})
+
+            # 累计收益曲线数据
+            equity_curve = []
+            for _, t in df.iterrows():
+                equity_curve.append({"date": t["日期"], "cum": round(float(t["累计"]) * 100 - 100, 1)})
+
+            yield sse({"type": "result", "data": {
+                "summary": {
+                    "total": total, "total_days": len(all_dates),
+                    "wins": wins, "losses": losses,
+                    "win_rate": round(win_rate, 1),
+                    "avg_ret": round(avg_ret, 2),
+                    "stop_avg": round(stop_avg, 2),
+                    "avg_win": round(avg_win, 2),
+                    "avg_loss": round(avg_loss, 2),
+                    "profit_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
+                    "max_win": round(float(df["收益率"].max()), 2),
+                    "max_loss": round(float(df["收益率"].min()), 2),
+                    "final_return": round(final_return, 1),
+                    "max_drawdown": round(max_dd, 1),
+                    "max_win_streak": max_ws,
+                    "max_lose_streak": max_ls,
+                    "threshold": bt_threshold,
+                    "sample_size": len(all_klines),
+                },
+                "strategies": strategies,
+                "monthly": month_list,
+                "equity_curve": equity_curve,
+                "trades": trades[-30:],
             }})
         except Exception as e:
             yield sse({"type": "error", "msg": str(e)})

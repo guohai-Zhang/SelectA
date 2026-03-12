@@ -2967,8 +2967,10 @@ def evaluate_signals_v2(df, capital_info=None, sector_score=0, sentiment_score=0
             score -= 5
             details["振幅风险"] = f"振幅{amplitude:.1f}%(-5)"
 
-    # ★ 总分上限280（避免各维度叠加超标）
-    score = min(score, 280)
+    # ★ 总分软上限：超过200分后递减，避免各维度叠加超标但保留区分度
+    if score > 200:
+        score = 200 + (score - 200) * 0.5  # 超出200的部分打5折
+    score = min(score, 300)  # 理论上限300
 
     reason_str = "；".join(reasons) if reasons else "信号不足"
     return score, details, reason_str
@@ -3388,7 +3390,7 @@ def analyze_single_v2(code):
     print()
     print("=" * 55)
     print(f"  {name}({code}) 深度分析报告")
-    print(f"  日期: {latest['日期']}    综合评分: {score:.1f}/280")
+    print(f"  日期: {latest['日期']}    综合评分: {score:.1f}/300")
     print("=" * 55)
 
     print()
@@ -3466,7 +3468,7 @@ def analyze_single_v2(code):
         print(f"  {key}: {val}")
 
     print()
-    print(f"  ★ 综合评分: {score:.1f}/280")
+    print(f"  ★ 综合评分: {score:.1f}/300")
     print(f"  买入理由: {reasons}")
     if score >= 170:
         print("  结论: 强烈关注！技术面+基本面+资金面+聪明钱共振")
@@ -3637,6 +3639,415 @@ def backtest(code=None, days=250):
             f"{t['卖出价']:.2f}", f"{t['收益率']:+.2f}%", emoji
         ])
     print(tabulate(trade_table, headers=["代码", "买入日", "买入价", "卖出价", "收益率", ""], tablefmt="simple_grid"))
+    print()
+
+
+# ============================================================
+# 模拟实盘回测：每日选全市场第1名，买入收盘→次日收盘卖出
+# ============================================================
+
+def simulate_daily_top1(days=250, sample_size=200):
+    """
+    模拟每天14:30-14:50跑决策，选第一名买入：
+    1. 取样本股的历史K线
+    2. 按日期遍历每个交易日
+    3. 对所有股票打分，选最高分那只（需超过门槛）
+    4. 买入当日收盘价，次日收盘价卖出
+    5. 统计胜率、收益分布、连续亏损等
+    """
+    print("=" * 65)
+    print("  模拟实盘回测：每日选TOP1")
+    print("=" * 65)
+    print()
+
+    cal_weights, cal_threshold, cal_combos = load_calibrated_weights()
+    bt_threshold = cal_threshold if cal_weights else 110
+    print(f"  [校准模式] 阈值={bt_threshold}")
+
+    # 选样本股
+    stock_list = fetch_stock_list_sina()
+    if stock_list.empty:
+        print("[错误] 无法获取股票列表")
+        return
+    active = stock_list[(stock_list["最新价"] >= 5) & (stock_list["最新价"] <= 80) &
+                        (stock_list["换手率"] >= 1)]
+    if len(active) < sample_size:
+        active = stock_list.head(sample_size)
+    codes = active.sample(min(sample_size, len(active)), random_state=42)["代码"].tolist()
+    print(f"  样本池: {len(codes)} 只股票 × ~{days} 交易日")
+    print(f"  策略: 每日选评分最高的1只 (门槛>={bt_threshold})，买收盘卖次日收盘")
+    print()
+
+    # Step1: 批量获取所有K线并计算指标
+    print("  [1/3] 批量获取K线数据...")
+    all_klines = {}
+    for i, c in enumerate(codes):
+        if (i + 1) % 50 == 0:
+            print(f"    进度: {i+1}/{len(codes)}")
+        kline = fetch_kline_long(c, days=days)
+        if kline.empty or len(kline) < 60:
+            continue
+        kline = calc_all_indicators(kline)
+        all_klines[c] = kline
+        time.sleep(0.1)
+    print(f"    有效股票: {len(all_klines)} 只")
+
+    if not all_klines:
+        print("  [错误] 无法获取K线数据")
+        return
+
+    # Step2: 收集所有交易日期
+    all_dates = set()
+    for kline in all_klines.values():
+        all_dates.update(kline["日期"].tolist())
+    all_dates = sorted(all_dates)
+
+    # 只取最近days个交易日，留30天预热期
+    if len(all_dates) > days:
+        all_dates = all_dates[-days:]
+
+    cap_sim = {"主力净流入占比": 3, "主力净流入": 1e7,
+               "超大单净流入": 0, "超大单占比": 0, "大单净流入": 0, "大单占比": 0}
+
+    # Step3: 逐日评分，收集每日TOP1的完整信息
+    print(f"  [2/3] 逐日评分选股 ({len(all_dates)} 个交易日)...")
+    trades = []
+    no_signal_days = 0
+    monthly_stats = {}
+
+    for di, date in enumerate(all_dates):
+        if (di + 1) % 50 == 0:
+            print(f"    进度: {di+1}/{len(all_dates)}")
+
+        best_code = None
+        best_score = -999
+        best_details = {}
+
+        for code, kline in all_klines.items():
+            date_mask = kline["日期"] == date
+            if not date_mask.any():
+                continue
+            idx = kline.index[date_mask][-1]
+            pos = kline.index.get_loc(idx)
+            if pos < 30 or pos >= len(kline) - 1:
+                continue
+
+            window = kline.iloc[:pos+1].copy()
+            sc, details, _ = evaluate_signals_v2(
+                window, cap_sim, 8, 8, 25, {},
+                calibrated_weights=cal_weights, golden_combos=cal_combos)
+
+            if sc > best_score:
+                best_score = sc
+                best_code = code
+                best_details = details
+                best_pos = pos
+                best_kline = kline
+
+        if best_score < bt_threshold or best_code is None:
+            no_signal_days += 1
+            continue
+
+        buy_price = best_kline.iloc[best_pos]["收盘"]
+        sell_price = best_kline.iloc[best_pos + 1]["收盘"]
+        pnl = (sell_price - buy_price) / buy_price * 100
+
+        sig_q = best_details.get("信号质量", "C级")
+        has_combo = best_details.get("黄金组合匹配", False)
+
+        # 提取高胜率信号数量
+        import re
+        hq_match = re.search(r"(\d+)个高胜率", sig_q)
+        high_count = int(hq_match.group(1)) if hq_match else 0
+
+        # 当日涨幅
+        today_chg = best_kline.iloc[best_pos].get("涨跌幅", 0)
+        # 当日振幅
+        row = best_kline.iloc[best_pos]
+        amplitude = (row["最高"] - row["最低"]) / row["最低"] * 100 if row["最低"] > 0 else 0
+        # 近3日累计涨幅
+        start = max(0, best_pos - 2)
+        cum_3d = (best_kline.iloc[best_pos]["收盘"] / best_kline.iloc[start]["收盘"] - 1) * 100
+
+        trades.append({
+            "日期": date, "代码": best_code, "评分": round(best_score, 1),
+            "买入价": buy_price, "卖出价": sell_price,
+            "收益率": pnl, "信号质量": sig_q, "黄金组合": has_combo,
+            "高胜率数": high_count, "当日涨幅": today_chg,
+            "振幅": amplitude, "近3日涨幅": cum_3d,
+        })
+
+        month_key = date[:7]
+        if month_key not in monthly_stats:
+            monthly_stats[month_key] = {"wins": 0, "total": 0, "returns": []}
+        monthly_stats[month_key]["total"] += 1
+        if pnl > 0:
+            monthly_stats[month_key]["wins"] += 1
+        monthly_stats[month_key]["returns"].append(pnl)
+
+    print(f"    完成！共 {len(trades)} 笔交易，{no_signal_days} 天无信号跳过")
+    print()
+
+    if not trades:
+        print("  回测期间无达标信号")
+        return
+
+    # Step4: 输出结果
+    print("  [3/3] 统计分析")
+    print()
+
+    df = pd.DataFrame(trades)
+    total = len(df)
+    wins = len(df[df["收益率"] > 0])
+    losses = len(df[df["收益率"] <= 0])
+    win_rate = wins / total * 100
+    avg_ret = df["收益率"].mean()
+    avg_win = df[df["收益率"] > 0]["收益率"].mean() if wins > 0 else 0
+    avg_loss = df[df["收益率"] <= 0]["收益率"].mean() if losses > 0 else 0
+    max_win = df["收益率"].max()
+    max_loss = df["收益率"].min()
+
+    # 止损后
+    df["止损收益"] = df["收益率"].clip(lower=-2)
+    stop_avg = df["止损收益"].mean()
+
+    # 累计收益曲线
+    df["累计收益"] = (1 + df["收益率"] / 100).cumprod()
+    final_return = (df["累计收益"].iloc[-1] - 1) * 100
+
+    # 最大回撤
+    cummax = df["累计收益"].cummax()
+    drawdown = ((df["累计收益"] - cummax) / cummax * 100)
+    max_dd = drawdown.min()
+
+    # 最大连续亏损
+    max_losing_streak = 0
+    current_streak = 0
+    for r in df["收益率"]:
+        if r <= 0:
+            current_streak += 1
+            max_losing_streak = max(max_losing_streak, current_streak)
+        else:
+            current_streak = 0
+
+    # 最大连续盈利
+    max_winning_streak = 0
+    current_streak = 0
+    for r in df["收益率"]:
+        if r > 0:
+            current_streak += 1
+            max_winning_streak = max(max_winning_streak, current_streak)
+        else:
+            current_streak = 0
+
+    print("  ══════════════════════════════════════════")
+    print("  ★ 模拟实盘结果（每日选TOP1）")
+    print("  ══════════════════════════════════════════")
+    print()
+    print(f"  交易天数:     {total} / {len(all_dates)} ({total/len(all_dates)*100:.0f}%有信号)")
+    print(f"  胜率:         {win_rate:.1f}% ({wins}胜 {losses}负)")
+    print(f"  平均收益:     {avg_ret:+.2f}%")
+    print(f"  止损后收益:   {stop_avg:+.2f}% (止损线-2%)")
+    print(f"  平均盈利:     {avg_win:+.2f}%")
+    print(f"  平均亏损:     {avg_loss:+.2f}%")
+    if avg_loss != 0:
+        print(f"  盈亏比:       {abs(avg_win/avg_loss):.2f}")
+    print(f"  最大单笔盈:   {max_win:+.2f}%")
+    print(f"  最大单笔亏:   {max_loss:+.2f}%")
+    print()
+    print(f"  累计收益:     {final_return:+.1f}% ({days}天)")
+    print(f"  最大回撤:     {max_dd:.1f}%")
+    print(f"  最长连胜:     {max_winning_streak} 天")
+    print(f"  最长连亏:     {max_losing_streak} 天")
+    print()
+
+    # 不同评分区间的胜率
+    print("  ── 按评分区间分析 ──")
+    score_bins = [(bt_threshold, bt_threshold + 20, f"{bt_threshold}-{bt_threshold+20}"),
+                  (bt_threshold + 20, bt_threshold + 50, f"{bt_threshold+20}-{bt_threshold+50}"),
+                  (bt_threshold + 50, 999, f"{bt_threshold+50}+")]
+    score_table = []
+    for lo, hi, label in score_bins:
+        subset = df[(df["评分"] >= lo) & (df["评分"] < hi)]
+        if len(subset) == 0:
+            continue
+        sw = len(subset[subset["收益率"] > 0])
+        swr = sw / len(subset) * 100
+        savg = subset["收益率"].mean()
+        score_table.append([label, len(subset), f"{swr:.1f}%", f"{savg:+.2f}%"])
+    if score_table:
+        print(tabulate(score_table, headers=["评分区间", "交易数", "胜率", "平均收益"],
+                       tablefmt="simple_grid"))
+    print()
+
+    # 按信号质量分析
+    print("  ── 按信号质量分析 ──")
+    sq_table = []
+    for q in ["A级", "B级", "C级"]:
+        subset = df[df["信号质量"].str.contains(q)]
+        if len(subset) == 0:
+            continue
+        sw = len(subset[subset["收益率"] > 0])
+        swr = sw / len(subset) * 100
+        savg = subset["收益率"].mean()
+        sq_table.append([q, len(subset), f"{swr:.1f}%", f"{savg:+.2f}%"])
+    if sq_table:
+        print(tabulate(sq_table, headers=["信号质量", "交易数", "胜率", "平均收益"],
+                       tablefmt="simple_grid"))
+    print()
+
+    # 月度胜率
+    print("  ── 月度表现 ──")
+    month_table = []
+    for month in sorted(monthly_stats.keys()):
+        ms = monthly_stats[month]
+        mwr = ms["wins"] / ms["total"] * 100 if ms["total"] > 0 else 0
+        mavg = np.mean(ms["returns"])
+        mcum = (np.prod([1 + r/100 for r in ms["returns"]]) - 1) * 100
+        month_table.append([month, ms["total"], f"{mwr:.0f}%", f"{mavg:+.2f}%", f"{mcum:+.1f}%"])
+    if month_table:
+        print(tabulate(month_table,
+                       headers=["月份", "交易数", "胜率", "日均收益", "月累计"],
+                       tablefmt="simple_grid"))
+    print()
+
+    # 收益分布
+    bins_edges = [-999, -5, -3, -2, -1, 0, 1, 2, 3, 5, 999]
+    labels = ["<-5%", "-5~-3%", "-3~-2%", "-2~-1%", "-1~0%",
+              "0~1%", "1~2%", "2~3%", "3~5%", ">5%"]
+    df["区间"] = pd.cut(df["收益率"], bins=bins_edges, labels=labels)
+    dist = df["区间"].value_counts().sort_index()
+    print("  ── 收益分布 ──")
+    dist_table = []
+    for label in labels:
+        count = dist.get(label, 0)
+        pct = count / total * 100
+        bar = "#" * int(pct / 2)
+        dist_table.append([label, count, f"{pct:.1f}%", bar])
+    print(tabulate(dist_table, headers=["区间", "次数", "占比", "分布"], tablefmt="simple_grid"))
+    print()
+
+    # ══════════ 策略优化扫描 ══════════
+    print("  ══════════════════════════════════════════")
+    print("  ★ 策略优化扫描：哪些过滤条件能提高胜率？")
+    print("  ══════════════════════════════════════════")
+    print()
+
+    def _calc_wr(subset):
+        if len(subset) == 0:
+            return 0, 0, 0
+        w = len(subset[subset["收益率"] > 0])
+        wr = w / len(subset) * 100
+        avg = subset["收益率"].mean()
+        return len(subset), wr, avg
+
+    opt_table = []
+    # 基准
+    n0, wr0, avg0 = _calc_wr(df)
+    opt_table.append(["基准(无过滤)", n0, f"{wr0:.1f}%", f"{avg0:+.2f}%", "-"])
+
+    # 1. 提高评分门槛
+    for th in [135, 140, 145]:
+        sub = df[df["评分"] >= th]
+        n, wr, avg = _calc_wr(sub)
+        opt_table.append([f"评分>={th}", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 2. 高胜率信号数量门槛
+    for hc in [5, 6, 7]:
+        sub = df[df["高胜率数"] >= hc]
+        n, wr, avg = _calc_wr(sub)
+        opt_table.append([f"高胜率信号>={hc}个", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 3. 当日涨幅过滤（避免追高）
+    for chg in [3, 5, 7]:
+        sub = df[df["当日涨幅"] <= chg]
+        n, wr, avg = _calc_wr(sub)
+        opt_table.append([f"当日涨幅<={chg}%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 4. 当日涨幅为负（逢跌买入）
+    sub = df[df["当日涨幅"] <= 0]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["当日下跌才买", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 5. 当日涨幅>0（顺势买入）
+    sub = df[df["当日涨幅"] > 0]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["当日上涨才买", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 6. 振幅过滤
+    for amp in [5, 7]:
+        sub = df[df["振幅"] <= amp]
+        n, wr, avg = _calc_wr(sub)
+        opt_table.append([f"振幅<={amp}%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 7. 近3日涨幅过滤（避免连续追高）
+    for cum in [5, 8, 10]:
+        sub = df[df["近3日涨幅"] <= cum]
+        n, wr, avg = _calc_wr(sub)
+        opt_table.append([f"近3日涨幅<={cum}%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 8. 黄金组合
+    sub = df[df["黄金组合"] == True]
+    n, wr, avg = _calc_wr(sub)
+    if n > 0:
+        opt_table.append(["仅黄金组合", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                          f"{wr-wr0:+.1f}%"])
+
+    # 9. 组合策略：评分>=135 + 高胜率>=6
+    sub = df[(df["评分"] >= 135) & (df["高胜率数"] >= 6)]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["评分>=135 + 高胜率>=6", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 10. 组合策略：高胜率>=6 + 当日涨幅<=3%
+    sub = df[(df["高胜率数"] >= 6) & (df["当日涨幅"] <= 3)]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["高胜率>=6 + 涨幅<=3%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 11. 组合策略：评分>=135 + 当日涨幅<=5%
+    sub = df[(df["评分"] >= 135) & (df["当日涨幅"] <= 5)]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["评分>=135 + 涨幅<=5%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 12. 组合策略：高胜率>=6 + 振幅<=5% + 近3日<=5%
+    sub = df[(df["高胜率数"] >= 6) & (df["振幅"] <= 5) & (df["近3日涨幅"] <= 5)]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["高胜率>=6+振幅<=5%+3日<=5%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    # 13. 最严格：评分>=140 + 高胜率>=6 + 涨幅<=3%
+    sub = df[(df["评分"] >= 140) & (df["高胜率数"] >= 6) & (df["当日涨幅"] <= 3)]
+    n, wr, avg = _calc_wr(sub)
+    opt_table.append(["评分>=140+高胜率>=6+涨<=3%", n, f"{wr:.1f}%", f"{avg:+.2f}%",
+                      f"{wr-wr0:+.1f}%"])
+
+    print(tabulate(opt_table,
+                   headers=["策略", "交易数", "胜率", "平均收益", "vs基准"],
+                   tablefmt="simple_grid"))
+    print()
+
+    # 最近30笔
+    print("  ── 最近30笔交易 ──")
+    recent = df.tail(30)
+    trade_table = []
+    for _, t in recent.iterrows():
+        emoji = "+" if t["收益率"] > 0 else "-" if t["收益率"] < 0 else "="
+        trade_table.append([
+            t["日期"], t["代码"], f"{t['评分']:.0f}", t["信号质量"],
+            f"{t['买入价']:.2f}", f"{t['卖出价']:.2f}", f"{t['收益率']:+.2f}%", emoji
+        ])
+    print(tabulate(trade_table,
+                   headers=["日期", "代码", "评分", "质量", "买入", "卖出", "收益", ""],
+                   tablefmt="simple_grid"))
     print()
 
 
@@ -3843,7 +4254,7 @@ def calibrate(days=250, sample_size=200):
         combo_name = " + ".join(sorted(combo))
         combo_table.append([combo_name, n, f"{wr:.1%}", f"{avg:+.2f}%",
                            f"{stop_avg:+.2f}%", f"{ev:.3f}"])
-        if wr >= 0.58 and n >= 10:
+        if wr >= 0.58 and n >= 30:
             best_combos.append({"signals": list(combo), "win_rate": wr,
                                 "avg_return": avg, "n": n})
 
@@ -4372,7 +4783,10 @@ def go_decision():
     priority_1 = stock_list[stock_list["代码"].isin(bb_codes & capital_codes)]["代码"].tolist()
     priority_2 = stock_list[stock_list["代码"].isin(capital_codes - bb_codes)]["代码"].tolist()
     priority_3 = stock_list[stock_list["代码"].isin(bb_codes - capital_codes)]["代码"].tolist()
-    others = stock_list[~stock_list["代码"].isin(capital_codes | bb_codes)]["代码"].tolist()[:200]
+    # 其他股票按量比+换手率排序，优先分析活跃票
+    others_df = stock_list[~stock_list["代码"].isin(capital_codes | bb_codes)].copy()
+    others_df["_activity"] = others_df["量比"].fillna(0) * 0.4 + others_df["换手率"].fillna(0) * 0.6
+    others = others_df.sort_values("_activity", ascending=False)["代码"].tolist()[:500]
     analyze_list = priority_1 + priority_2 + priority_3 + others
     code_to_row = stock_list.set_index("代码").to_dict("index")
 
@@ -4492,8 +4906,8 @@ def go_decision():
             rec_level = "推荐"
         elif total_score >= go_threshold:
             rec_level = "弱推荐"
-        elif total_score >= go_threshold * 0.7:
-            rec_level = "弱推荐"
+        elif total_score >= go_threshold * 0.8 and "C级" not in sig_q:
+            rec_level = "观望"
         else:
             rec_level = "仅参考"
 
@@ -4599,7 +5013,7 @@ def go_decision():
             print(f"  市值: {stock['市值亿']:.0f}亿 (大盘股风控已启用)")
         if stock.get("行业"):
             print(f"  行业: {stock['行业']}")
-        print(f"  评分: {stock['评分']:.1f}/280")
+        print(f"  评分: {stock['评分']:.1f}/300")
         score_parts = [f"技术面{stock['技术分']:.1f}分", f"基本面{stock['基本面分']}/50分",
                        f"聪明钱{stock['聪明钱分']}/80分"]
         if stock["新闻加分"] > 0:
@@ -5816,6 +6230,8 @@ if __name__ == "__main__":
             update_outcomes()
         except Exception as e:
             print(f"[错误] {e}")
+    elif args[0] == "--simulate":
+        simulate_daily_top1()
     elif args[0] == "--calibrate":
         calibrate()
     elif args[0] == "--market":

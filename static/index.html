@@ -253,6 +253,20 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div id="stock-result"></div>
 </div>
 
+<!-- 回测 -->
+<div id="p-sim" class="page">
+  <div style="padding-top:20vh;text-align:center" id="sim-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">模拟实盘：每日选TOP1，统计历史胜率</div>
+    <button class="btn btn-primary" id="btn-sim" onclick="startSim()" style="max-width:280px;margin:0 auto;font-size:17px;padding:16px;border-radius:14px;background:#9370db">模拟回测</button>
+    <div style="font-size:11px;color:var(--text3);margin-top:8px">200只样本 x 250天，约需3-5分钟</div>
+  </div>
+  <div id="sim-progress" style="display:none">
+    <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="sim-msg">准备中...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="sim-bar"></div></div>
+  </div>
+  <div id="sim-results"></div>
+</div>
+
 <!-- 战绩 -->
 <div id="p-trades" class="page">
   <div style="text-align:center;margin-bottom:12px">
@@ -271,6 +285,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div class="tab" onclick="switchTab('etf',this)"><span class="icon">&#128176;</span>ETF</div>
   <div class="tab" onclick="switchTab('sector',this)"><span class="icon">&#128200;</span>板块</div>
   <div class="tab" onclick="switchTab('stock',this)"><span class="icon">&#128269;</span>个股</div>
+  <div class="tab" onclick="switchTab('sim',this)"><span class="icon">&#128202;</span>回测</div>
   <div class="tab" onclick="switchTab('trades',this)"><span class="icon">&#127942;</span>战绩</div>
 </div>
 
@@ -328,7 +343,7 @@ function switchTab(name, el) {
   $$('.tab').forEach(t => t.classList.remove('active'));
   $(`#p-${name}`).classList.add('active');
   if (el) el.classList.add('active');
-  else { const idx = ['market','scan','go','go5','etf','sector','stock','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
+  else { const idx = ['market','scan','go','go5','etf','sector','stock','sim','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
   currentTab = name;
   localStorage.setItem('tab', name);
   if (name === 'market' && !marketLoaded) loadMarket();
@@ -524,16 +539,16 @@ function renderGoResults(data) {
     const rk = (s.risk && Object.keys(s.risk).length) ? s.risk : null;
     const c = chgClass(s['涨跌幅']);
     const rl = s['推荐等级'] || '仅参考';
-    const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : 'var(--text3)';
-    const borderColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : 'var(--border)';
-    const rlNote = rl === '强推荐' ? '(回测胜率64%+)' : rl === '推荐' ? '(回测胜率57%+)' : rl === '弱推荐' ? '(回测胜率55%+)' : '(回测胜率<55%,慎入)';
+    const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : rl === '观望' ? '#9370db' : 'var(--text3)';
+    const borderColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : rl === '观望' ? '#9370db' : 'var(--border)';
+    const rlNote = rl === '强推荐' ? '(回测胜率64%+)' : rl === '推荐' ? '(回测胜率57%+)' : rl === '弱推荐' ? '(回测胜率55%+)' : rl === '观望' ? '(接近门槛,观望为主)' : '(回测胜率<55%,慎入)';
     html += `<div class="go-stock" style="border-color:${borderColor}">
       <div class="go-stock-header">
         <div>
           <div class="go-stock-name">第${i+1}只: ${s['名称']}(${s['代码']})</div>
           <div style="font-size:12px"><span style="color:${rlColor};font-weight:600">${rl}</span> <span style="font-size:10px;color:var(--text3)">${rlNote}</span> <span style="color:var(--text2)">${s['行业'] || ''}</span></div>
         </div>
-        <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/280</span></div>
+        <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/300</span></div>
       </div>
       <div style="font-size:13px" class="${c}">现价 ${(s['最新价']||0).toFixed(2)} (${chgStr(s['涨跌幅']||0)})</div>
       <div style="font-size:12px;color:var(--text2);margin-top:4px">
@@ -866,7 +881,7 @@ function renderStock(d) {
     <div style="font-size:12px;color:var(--text2)">${d.industry || ''}</div>
     <div class="detail-price ${c}">${(d.price||0).toFixed(2)} <span style="font-size:16px">${chgStr(d.change||0)}</span></div>
     <div class="detail-score ${sc}">${d.score}</div>
-    <div class="detail-max">/280 综合评分</div>
+    <div class="detail-max">/300 综合评分</div>
   </div>`;
 
   // 风险警告
@@ -1013,6 +1028,216 @@ function renderTrades(d) {
 // ── 初始化 ──
 switchTab(currentTab);
 if (currentTab === 'market') loadMarket();
+
+// ── 回测 ──
+function startSim() {
+  $('#sim-btn-wrap').style.display='none';
+  $('#sim-progress').style.display='block';
+  $('#sim-results').textContent='';
+  sseConnect('/api/simulate', (d, es) => {
+    if (d.type==='progress') {
+      $('#sim-msg').textContent=d.msg;
+      $('#sim-bar').style.width=d.pct+'%';
+    } else if (d.type==='error') {
+      $('#sim-msg').textContent='错误: '+d.msg;
+      es.close();
+    } else if (d.type==='result') {
+      es.close();
+      $('#sim-progress').style.display='none';
+      renderSim(d.data);
+    }
+  }, () => { $('#sim-btn-wrap').style.display='block'; });
+}
+
+function renderSim(data) {
+  const container = $('#sim-results');
+  container.textContent = '';
+  const s = data.summary;
+  const wrColor = s.win_rate >= 70 ? 'var(--green)' : s.win_rate >= 60 ? 'var(--gold)' : 'var(--red)';
+
+  // Summary card
+  const summaryCard = document.createElement('div');
+  summaryCard.className = 'card';
+  const title = document.createElement('div');
+  title.className = 'card-title';
+  title.textContent = '模拟实盘结果（每日选TOP1）';
+  summaryCard.appendChild(title);
+
+  const wrDiv = document.createElement('div');
+  wrDiv.style.cssText = 'text-align:center;margin:16px 0';
+  const wrNum = document.createElement('div');
+  wrNum.style.cssText = 'font-size:36px;font-weight:700;color:'+wrColor;
+  wrNum.textContent = s.win_rate + '%';
+  const wrLabel = document.createElement('div');
+  wrLabel.style.cssText = 'font-size:12px;color:var(--text2)';
+  wrLabel.textContent = '胜率 (' + s.wins + '胜 ' + s.losses + '负 / ' + s.total_days + '天)';
+  wrDiv.appendChild(wrNum);
+  wrDiv.appendChild(wrLabel);
+  summaryCard.appendChild(wrDiv);
+
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px';
+  const metrics = [
+    ['日均收益', (s.avg_ret>0?'+':'') + s.avg_ret + '%', s.avg_ret>0?'var(--green)':'var(--red)'],
+    ['止损后收益', (s.stop_avg>0?'+':'') + s.stop_avg + '%', s.stop_avg>0?'var(--green)':'var(--red)'],
+    ['累计收益', (s.final_return>0?'+':'') + s.final_return + '%', 'var(--green)'],
+    ['最大回撤', s.max_drawdown + '%', 'var(--red)'],
+    ['盈亏比', String(s.profit_ratio), ''],
+    ['连胜/连亏', s.max_win_streak + ' / ' + s.max_lose_streak, ''],
+  ];
+  metrics.forEach(([label, val, color]) => {
+    const cell = document.createElement('div');
+    cell.className = 'card';
+    cell.style.cssText = 'padding:10px;text-align:center';
+    const lb = document.createElement('div');
+    lb.style.cssText = 'color:var(--text2);font-size:11px';
+    lb.textContent = label;
+    const vl = document.createElement('div');
+    vl.style.cssText = 'font-size:18px;font-weight:600;' + (color ? 'color:'+color : '');
+    vl.textContent = val;
+    cell.appendChild(lb);
+    cell.appendChild(vl);
+    grid.appendChild(cell);
+  });
+  summaryCard.appendChild(grid);
+
+  const info = document.createElement('div');
+  info.style.cssText = 'font-size:11px;color:var(--text3);margin-top:8px;text-align:center';
+  info.textContent = '样本' + s.sample_size + '只 | 门槛' + s.threshold + '分 | ' + s.total + '/' + s.total_days + '天有信号(' + Math.round(s.total/s.total_days*100) + '%)';
+  summaryCard.appendChild(info);
+  container.appendChild(summaryCard);
+
+  // Helper: create table
+  function makeTable(titleText, headers, rows) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const t = document.createElement('div');
+    t.className = 'card-title';
+    t.textContent = titleText;
+    card.appendChild(t);
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'overflow-x:auto';
+    const table = document.createElement('table');
+    table.className = 'kline-table';
+    const thead = document.createElement('thead');
+    const htr = document.createElement('tr');
+    headers.forEach((h, i) => {
+      const th = document.createElement('th');
+      th.textContent = h;
+      if (i === 0) th.style.textAlign = 'left';
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      if (row._bold) tr.style.fontWeight = '600';
+      row.cells.forEach((c, i) => {
+        const td = document.createElement('td');
+        td.textContent = c.text;
+        if (i === 0) td.style.textAlign = 'left';
+        if (c.color) td.style.color = c.color;
+        if (c.fontSize) td.style.fontSize = c.fontSize;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    card.appendChild(wrap);
+    return card;
+  }
+
+  // Strategy scan table
+  const stratRows = data.strategies.map(st => {
+    const dc = st.delta === '-' ? '' : st.delta > 0 ? 'var(--green)' : st.delta < 0 ? 'var(--red)' : '';
+    return {
+      _bold: st.delta !== '-' && st.delta >= 5,
+      cells: [
+        {text: st.name, fontSize: '12px'},
+        {text: String(st.n)},
+        {text: st.wr + '%'},
+        {text: (st.avg>0?'+':'') + st.avg + '%'},
+        {text: st.delta==='-'?'-':(st.delta>0?'+':'') + st.delta + '%', color: dc},
+      ]
+    };
+  });
+  container.appendChild(makeTable('策略优化扫描', ['策略','交易','胜率','收益','vs基准'], stratRows));
+
+  // Monthly table
+  const monthRows = data.monthly.map(m => ({
+    cells: [
+      {text: m.month},
+      {text: String(m.n)},
+      {text: m.wr + '%'},
+      {text: (m.avg>0?'+':'') + m.avg + '%'},
+      {text: (m.cum>0?'+':'') + m.cum + '%', color: m.cum>=0?'var(--green)':'var(--red)'},
+    ]
+  }));
+  container.appendChild(makeTable('月度表现', ['月份','交易','胜率','日均','月累计'], monthRows));
+
+  // Equity curve
+  if (data.equity_curve && data.equity_curve.length > 0) {
+    const curveCard = document.createElement('div');
+    curveCard.className = 'card';
+    const ct = document.createElement('div');
+    ct.className = 'card-title';
+    ct.textContent = '累计收益曲线';
+    curveCard.appendChild(ct);
+    const chart = document.createElement('div');
+    chart.style.cssText = 'height:120px;display:flex;align-items:flex-end;gap:1px;padding:8px 0';
+    const pts = data.equity_curve;
+    const maxV = Math.max(...pts.map(p=>p.cum), 1);
+    const minV = Math.min(...pts.map(p=>p.cum), 0);
+    const range = maxV - minV || 1;
+    const step = Math.max(1, Math.floor(pts.length / 80));
+    for (let i = 0; i < pts.length; i += step) {
+      const p = pts[i];
+      const hPx = Math.max(1, ((p.cum - minV) / range) * 100);
+      const bar = document.createElement('div');
+      bar.style.cssText = 'flex:1;min-width:1px;border-radius:1px 1px 0 0;background:' + (p.cum>=0?'var(--green)':'var(--red)') + ';height:' + hPx + 'px';
+      bar.title = p.date + ': ' + (p.cum>0?'+':'') + p.cum + '%';
+      chart.appendChild(bar);
+    }
+    curveCard.appendChild(chart);
+    const axis = document.createElement('div');
+    axis.style.cssText = 'display:flex;justify-content:space-between;font-size:10px;color:var(--text3)';
+    const d1 = document.createElement('span');
+    d1.textContent = pts[0].date;
+    const d2 = document.createElement('span');
+    d2.textContent = pts[pts.length-1].date;
+    axis.appendChild(d1);
+    axis.appendChild(d2);
+    curveCard.appendChild(axis);
+    container.appendChild(curveCard);
+  }
+
+  // Recent trades table
+  const tradeRows = data.trades.map(t => ({
+    cells: [
+      {text: t['日期'], fontSize: '11px'},
+      {text: t['代码']},
+      {text: String(t['评分'])},
+      {text: String(t['买入价'])},
+      {text: String(t['卖出价'])},
+      {text: (t['收益率']>0?'+':'') + t['收益率'] + '%',
+       color: t['收益率']>0?'var(--green)':t['收益率']<0?'var(--red)':''},
+    ]
+  }));
+  container.appendChild(makeTable('最近30笔交易', ['日期','代码','评分','买入','卖出','收益'], tradeRows));
+
+  // Re-run button
+  const btnWrap = document.createElement('div');
+  btnWrap.style.cssText = 'text-align:center;margin:16px 0';
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-primary';
+  btn.style.cssText = 'max-width:200px;margin:0 auto;padding:10px 24px;font-size:14px;border-radius:10px;background:#9370db';
+  btn.textContent = '重新回测';
+  btn.onclick = () => { container.textContent=''; $('#sim-btn-wrap').style.display='block'; };
+  btnWrap.appendChild(btn);
+  container.appendChild(btnWrap);
+}
 
 // 回车搜索
 $('#stock-input').addEventListener('keydown', e => { if (e.key === 'Enter') analyzeStock(); });

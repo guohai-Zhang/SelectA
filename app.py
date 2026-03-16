@@ -1406,6 +1406,108 @@ def api_simulate():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── API: 下影线选股 (SSE) ──
+
+@app.get("/api/shadow")
+def api_shadow():
+    def generate():
+        try:
+            yield sse({"type": "progress", "msg": "获取股票列表...", "pct": 5})
+
+            stock_list = t1.fetch_stock_list_sina()
+            if stock_list.empty:
+                yield sse({"type": "error", "msg": "获取股票列表失败"})
+                return
+
+            # 非ST、有效价格
+            df = stock_list[
+                (~stock_list["名称"].str.contains("ST|退市", na=False)) &
+                (stock_list["最新价"] > 0) &
+                (stock_list["今开"] > 0) &
+                (stock_list["最高"] > 0) &
+                (stock_list["最低"] > 0)
+            ].copy()
+
+            # 影线计算
+            df["收盘"] = df["最新价"]
+            df["实体上"] = df[["今开", "收盘"]].max(axis=1)
+            df["实体下"] = df[["今开", "收盘"]].min(axis=1)
+            df["上影线"] = df["最高"] - df["实体上"]
+            df["下影线"] = df["实体下"] - df["最低"]
+            df["实体"] = df["实体上"] - df["实体下"]
+
+            has_shadow = df["下影线"] > 0
+            upper_exists = df["上影线"] > 0.001
+            cond_with_upper = upper_exists & (df["下影线"] > df["上影线"])
+            cond_no_upper = (~upper_exists) & (df["下影线"] > df["实体"])
+            shadow_df = df[has_shadow & (cond_with_upper | cond_no_upper)].copy()
+
+            yield sse({"type": "progress", "msg": f"验证 {len(shadow_df)} 只候选...", "pct": 20})
+
+            codes = shadow_df["代码"].tolist()
+            results = []
+            done = [0]
+            total = len(codes)
+
+            def check_one(code):
+                try:
+                    kline = t1.fetch_kline(code, days=5)
+                    if kline is None or kline.empty or len(kline) < 2:
+                        return None
+                    today = kline.iloc[-1]
+                    yesterday = kline.iloc[-2]
+                    if today["最高"] < yesterday["最高"] and today["最低"] < yesterday["最低"]:
+                        return {"code": code, "yest_high": yesterday["最高"], "yest_low": yesterday["最低"]}
+                    return None
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                futures = {executor.submit(check_one, c): c for c in codes}
+                for f in as_completed(futures):
+                    done[0] += 1
+                    r = f.result()
+                    if r:
+                        results.append(r)
+                    if done[0] % 100 == 0 and total > 0:
+                        pct = 20 + int(done[0] / total * 60)
+                        yield sse({"type": "progress",
+                                   "msg": f"验证 {done[0]}/{total}，已找到 {len(results)} 只",
+                                   "pct": min(pct, 80)})
+
+            passed_codes = {r["code"] for r in results}
+            final_df = shadow_df[shadow_df["代码"].isin(passed_codes)].copy()
+            final_df = final_df.sort_values("下影线", ascending=False)
+
+            kdata_map = {r["code"]: r for r in results}
+            output = []
+            for _, row in final_df.iterrows():
+                code = str(row["代码"])
+                kd = kdata_map.get(code, {})
+                output.append(jsonable({
+                    "代码": code,
+                    "名称": str(row.get("名称", "")),
+                    "最新价": row["最新价"],
+                    "涨跌幅": round(row.get("涨跌幅", 0) or 0, 2),
+                    "下影线": round(row["下影线"], 2),
+                    "上影线": round(row["上影线"], 2),
+                    "实体": round(row["实体"], 2),
+                    "昨日最高": kd.get("yest_high", 0),
+                    "昨日最低": kd.get("yest_low", 0),
+                }))
+
+            yield sse({"type": "result", "data": {
+                "results": output,
+                "summary": {"候选池": len(shadow_df), "通过": len(output)},
+            }})
+
+        except Exception as e:
+            yield sse({"type": "error", "msg": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 # ── 启动入口 ──
 
 if __name__ == "__main__":

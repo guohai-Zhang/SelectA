@@ -22,6 +22,7 @@ A股 T+1 短线分析工具 v3.0
     python3 t1_trader.py --etf          # ETF波段扫描（持有1-5天）
     python3 t1_trader.py --etf-go       # ETF波段一键决策：推荐3只ETF+操作计划
     python3 t1_trader.py --ztb          # 涨停扫描：早盘10:00-10:30预判当天涨停候选
+    python3 t1_trader.py --shadow       # 下影线选股：盘后运行，筛选重心下移+长下影线
 """
 
 import requests
@@ -6747,6 +6748,150 @@ def scan_zt_board(top_n=10):
 
 
 # ============================================================
+# 下影线筛选（盘后运行）
+# ============================================================
+
+def scan_shadow():
+    """
+    盘后下影线选股：
+    1. 有下影线，下影线 > 上影线（无上影线时下影线 > 实体）
+    2. 今日最高 < 昨日最高 且 今日最低 < 昨日最低（重心下移）
+    3. 非ST
+    """
+    print("=" * 65)
+    print("  下影线选股（盘后）")
+    print(f"  扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 65)
+    print()
+
+    # ── 获取全市场股票列表 ──
+    print("[1/3] 获取股票列表...")
+    stock_list = fetch_stock_list_sina()
+    if stock_list.empty:
+        print("[错误] 获取股票列表失败")
+        return []
+
+    # 基础过滤：非ST、有效价格
+    df = stock_list[
+        (~stock_list["名称"].str.contains("ST|退市", na=False)) &
+        (stock_list["最新价"] > 0) &
+        (stock_list["今开"] > 0) &
+        (stock_list["最高"] > 0) &
+        (stock_list["最低"] > 0)
+    ].copy()
+    print(f"  非ST有效股票: {len(df)} 只")
+
+    # ── 计算影线，先筛条件1 ──
+    df["收盘"] = df["最新价"]
+    df["实体上"] = df[["今开", "收盘"]].max(axis=1)
+    df["实体下"] = df[["今开", "收盘"]].min(axis=1)
+    df["上影线"] = df["最高"] - df["实体上"]
+    df["下影线"] = df["实体下"] - df["最低"]
+    df["实体"] = df["实体上"] - df["实体下"]
+
+    # 条件1：有下影线，且下影线 > 上影线；无上影线时下影线 > 实体
+    has_shadow = df["下影线"] > 0
+    upper_exists = df["上影线"] > 0.001
+    cond_with_upper = upper_exists & (df["下影线"] > df["上影线"])
+    cond_no_upper = (~upper_exists) & (df["下影线"] > df["实体"])
+    cond1 = has_shadow & (cond_with_upper | cond_no_upper)
+
+    shadow_df = df[cond1].copy()
+    print(f"  下影线筛选通过: {len(shadow_df)} 只")
+
+    if shadow_df.empty:
+        print("  无符合条件的股票")
+        return []
+
+    # ── 批量获取K线，检查条件2：今日高低 < 昨日高低 ──
+    print(f"[2/3] 获取K线验证昨日高低（{len(shadow_df)} 只）...")
+    codes = shadow_df["代码"].tolist()
+    results = []
+    done = 0
+
+    def check_one(code):
+        try:
+            kline = fetch_kline(code, days=5)
+            if kline is None or kline.empty or len(kline) < 2:
+                return None
+            today = kline.iloc[-1]
+            yesterday = kline.iloc[-2]
+            # 条件2：今日最高 < 昨日最高 且 今日最低 < 昨日最低
+            if today["最高"] < yesterday["最高"] and today["最低"] < yesterday["最低"]:
+                return {
+                    "code": code,
+                    "yest_high": yesterday["最高"],
+                    "yest_low": yesterday["最低"],
+                    "today_high": today["最高"],
+                    "today_low": today["最低"],
+                }
+            return None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(check_one, c): c for c in codes}
+        for f in as_completed(futures):
+            done += 1
+            r = f.result()
+            if r:
+                results.append(r)
+            if done % 100 == 0:
+                print(f"  进度 {done}/{len(codes)}，已找到 {len(results)} 只")
+
+    print(f"  重心下移验证通过: {len(results)} 只")
+
+    if not results:
+        print("  无符合全部条件的股票")
+        return []
+
+    # ── 合并输出 ──
+    print()
+    print(f"[3/3] 最终结果: {len(results)} 只")
+    print("-" * 65)
+    print(f"{'代码':<8} {'名称':<8} {'最新价':>7} {'涨跌幅':>7} {'下影线':>7} {'上影线':>7} {'实体':>7}")
+    print("-" * 65)
+
+    passed_codes = {r["code"] for r in results}
+    final_df = shadow_df[shadow_df["代码"].isin(passed_codes)].copy()
+    final_df = final_df.sort_values("下影线", ascending=False)
+
+    output = []
+    for _, row in final_df.iterrows():
+        code = str(row["代码"])
+        name = str(row.get("名称", ""))
+        price = row["最新价"]
+        chg = row.get("涨跌幅", 0) or 0
+        lower = row["下影线"]
+        upper = row["上影线"]
+        body = row["实体"]
+        # 找到对应的昨日数据
+        kdata = next((r for r in results if r["code"] == code), {})
+        print(f"{code:<8} {name:<8} {price:>7.2f} {chg:>+6.1f}% {lower:>7.2f} {upper:>7.2f} {body:>7.2f}")
+        output.append({
+            "代码": code,
+            "名称": name,
+            "最新价": price,
+            "涨跌幅": round(chg, 2),
+            "下影线": round(lower, 2),
+            "上影线": round(upper, 2),
+            "实体": round(body, 2),
+            "昨日最高": kdata.get("yest_high", 0),
+            "昨日最低": kdata.get("yest_low", 0),
+        })
+
+    print("-" * 65)
+    print(f"  共 {len(output)} 只符合条件")
+    print()
+    print("  筛选条件:")
+    print("  1. 有下影线，下影线 > 上影线（无上影线时下影线 > 实体）")
+    print("  2. 今日最高 < 昨日最高 且 今日最低 < 昨日最低（重心下移）")
+    print("  3. 非ST")
+
+    return output
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -6794,6 +6939,8 @@ if __name__ == "__main__":
         etf_go()
     elif args[0] == "--ztb":
         scan_zt_board()
+    elif args[0] == "--shadow":
+        scan_shadow()
     elif args[0] == "--top":
         top_n = int(args[1]) if len(args) > 1 else 15
         scan_market_v2(top_n)

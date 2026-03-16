@@ -290,6 +290,20 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div id="trades-list"></div>
 </div>
 
+<!-- 下影线 -->
+<div id="p-shadow" class="page">
+  <div style="padding-top:28vh;text-align:center" id="shadow-btn-wrap">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">下影线选股：盘后运行，筛选重心下移+长下影线</div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:12px">条件：下影线&ge;实体&times;2 + 今日高低&lt;昨日高低 + 非ST &mdash; 次日买入</div>
+    <button class="btn btn-primary" id="btn-shadow" onclick="startShadow()" style="max-width:280px;margin:0 auto;font-size:17px;padding:16px;border-radius:14px;background:#26a69a">下影线扫描</button>
+  </div>
+  <div id="shadow-progress" style="display:none">
+    <div style="margin-top:12px;font-size:13px;color:var(--text2)" id="shadow-msg">准备中...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="shadow-bar"></div></div>
+  </div>
+  <div id="shadow-results"></div>
+</div>
+
 <!-- 标签栏 -->
 <div class="tabs">
   <div class="tab active" onclick="switchTab('market',this)"><span class="icon">&#127968;</span>首页</div>
@@ -298,6 +312,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,
   <div class="tab" onclick="switchTab('go5',this)"><span class="icon">&#128293;</span>波段</div>
   <div class="tab" onclick="switchTab('etf',this)"><span class="icon">&#128176;</span>ETF</div>
   <div class="tab" onclick="switchTab('ztb',this)"><span class="icon">&#9889;</span>涨停</div>
+  <div class="tab" onclick="switchTab('shadow',this)"><span class="icon">&#9660;</span>下影</div>
   <div class="tab" onclick="switchTab('sector',this)"><span class="icon">&#128200;</span>板块</div>
   <div class="tab" onclick="switchTab('stock',this)"><span class="icon">&#128269;</span>个股</div>
   <div class="tab" onclick="switchTab('sim',this)"><span class="icon">&#128202;</span>回测</div>
@@ -358,7 +373,7 @@ function switchTab(name, el) {
   $$('.tab').forEach(t => t.classList.remove('active'));
   $(`#p-${name}`).classList.add('active');
   if (el) el.classList.add('active');
-  else { const idx = ['market','scan','go','go5','etf','ztb','sector','stock','sim','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
+  else { const idx = ['market','scan','go','go5','etf','ztb','shadow','sector','stock','sim','trades'].indexOf(name); if(idx>=0) $$('.tab')[idx].classList.add('active'); }
   currentTab = name;
   localStorage.setItem('tab', name);
   if (name === 'market' && !marketLoaded) loadMarket();
@@ -1056,6 +1071,175 @@ function renderZtbResults(data) {
    '5. 没涨停：次日止损（-3%）',
    '6. 仓位严格控制，单只不超过总资金20%',
    '7. 以上仅为技术分析，不构成投资建议！',
+  ].forEach(text => {
+    const p = document.createElement('div');
+    p.textContent = text;
+    warnList.appendChild(p);
+  });
+  warnCard.appendChild(warnList);
+  container.appendChild(warnCard);
+}
+
+// ── 下影线 ──
+function startShadow() {
+  $('#btn-shadow').disabled = true;
+  $('#shadow-btn-wrap').style.paddingTop = '16px';
+  $('#shadow-progress').style.display = 'block';
+  $('#shadow-results').textContent = '';
+  sseConnect('/api/shadow', (d, es) => {
+    if (d.type === 'progress') {
+      $('#shadow-msg').textContent = d.msg;
+      $('#shadow-bar').style.width = (d.pct || 0) + '%';
+    } else if (d.type === 'error') {
+      toast(d.msg); es.close(); $('#btn-shadow').disabled = false;
+    } else if (d.type === 'result') {
+      es.close(); $('#btn-shadow').disabled = false;
+      $('#shadow-progress').style.display = 'none';
+      renderShadowResults(d.data);
+    }
+  }, () => { $('#btn-shadow').disabled = false; });
+}
+
+function _mkCell(label, val, color) {
+  const d = document.createElement('div');
+  const sp = document.createElement('span');
+  sp.style.color = 'var(--text2)';
+  sp.textContent = label;
+  d.appendChild(sp);
+  d.appendChild(document.createTextNode(' '));
+  const b = document.createElement('b');
+  if (color) b.style.color = color;
+  b.textContent = val;
+  d.appendChild(b);
+  return d;
+}
+
+function renderShadowResults(data) {
+  const results = data.results || [];
+  const sm = data.summary || {};
+  const container = $('#shadow-results');
+  container.textContent = '';
+
+  // 概览
+  const overviewCard = document.createElement('div');
+  overviewCard.className = 'card';
+  const overviewTitle = document.createElement('div');
+  overviewTitle.className = 'card-title';
+  overviewTitle.style.color = '#26a69a';
+  overviewTitle.textContent = '下影线选股概览';
+  overviewCard.appendChild(overviewTitle);
+  const overviewGrid = document.createElement('div');
+  overviewGrid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px';
+  [
+    ['候选池(影线)', (sm['候选池']||0) + ' 只', ''],
+    ['通过(重心下移)', (sm['通过']||0) + ' 只', 'up'],
+  ].forEach(([label, val, cls]) => {
+    const d = document.createElement('div');
+    d.textContent = label + ': ';
+    const b = document.createElement('b');
+    if (cls) b.className = cls;
+    b.textContent = val;
+    d.appendChild(b);
+    overviewGrid.appendChild(d);
+  });
+  overviewCard.appendChild(overviewGrid);
+  container.appendChild(overviewCard);
+
+  if (results.length) {
+    results.forEach(s => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.style.cssText = 'cursor:pointer;border-left:3px solid #26a69a';
+      card.onclick = () => goStock(s['代码']);
+
+      // 头部：名称 + 价格
+      const header = document.createElement('div');
+      header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px';
+      const left = document.createElement('div');
+      const nameEl = document.createElement('div');
+      nameEl.style.cssText = 'font-size:15px;font-weight:700';
+      nameEl.textContent = s['名称'];
+      left.appendChild(nameEl);
+      const codeEl = document.createElement('div');
+      codeEl.style.cssText = 'font-size:11px;color:var(--text2)';
+      codeEl.textContent = s['代码'];
+      left.appendChild(codeEl);
+      header.appendChild(left);
+
+      const right = document.createElement('div');
+      right.style.textAlign = 'right';
+      const priceEl = document.createElement('div');
+      priceEl.style.cssText = 'font-size:16px;font-weight:600';
+      priceEl.className = chgClass(s['涨跌幅']);
+      priceEl.textContent = (s['最新价']||0).toFixed(2);
+      right.appendChild(priceEl);
+      const chgEl = document.createElement('div');
+      chgEl.style.fontSize = '12px';
+      chgEl.className = chgClass(s['涨跌幅']);
+      chgEl.textContent = chgStr(s['涨跌幅']||0);
+      right.appendChild(chgEl);
+      header.appendChild(right);
+      card.appendChild(header);
+
+      // 影线指标
+      const shadowGrid = document.createElement('div');
+      shadowGrid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 8px;font-size:12px;margin-bottom:6px';
+      [
+        ['下影线', (s['下影线']||0).toFixed(2), '#26a69a'],
+        ['上影线', (s['上影线']||0).toFixed(2), ''],
+        ['实体', (s['实体']||0).toFixed(2), ''],
+        ['影/体比', (s['影体比']||0).toFixed(1) + 'x', '#26a69a'],
+        ['振幅', (s['振幅']||0).toFixed(1) + '%', ''],
+        ['量比', (s['量比']||0).toFixed(1), (s['量比']||0) >= 1.5 ? '#ffd740' : ''],
+      ].forEach(([label, val, color]) => {
+        shadowGrid.appendChild(_mkCell(label, val, color));
+      });
+      card.appendChild(shadowGrid);
+
+      // 交易指标
+      const tradeGrid = document.createElement('div');
+      tradeGrid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 8px;font-size:12px;border-top:1px solid var(--border);padding-top:6px';
+      const vol = s['成交额'] || 0;
+      const volStr = vol >= 1e8 ? (vol/1e8).toFixed(1) + '亿' : vol >= 1e4 ? (vol/1e4).toFixed(0) + '万' : vol.toFixed(0);
+      const cap = s['流通市值'] || 0;
+      const capStr = cap >= 1e8 ? (cap/1e8).toFixed(0) + '亿' : cap >= 1e4 ? (cap/1e4).toFixed(0) + '万' : '--';
+      [
+        ['换手率', (s['换手率']||0).toFixed(1) + '%', ''],
+        ['成交额', volStr, ''],
+        ['流通值', capStr, ''],
+        ['市盈率', s['市盈率'] ? s['市盈率'].toFixed(1) : '--', ''],
+        ['昨高', (s['昨日最高']||0).toFixed(2), 'var(--text2)'],
+        ['昨低', (s['昨日最低']||0).toFixed(2), 'var(--text2)'],
+      ].forEach(([label, val, color]) => {
+        tradeGrid.appendChild(_mkCell(label, val, color));
+      });
+      card.appendChild(tradeGrid);
+      container.appendChild(card);
+    });
+  } else {
+    const emptyCard = document.createElement('div');
+    emptyCard.className = 'card';
+    emptyCard.style.cssText = 'text-align:center;padding:40px 20px;color:var(--text2)';
+    emptyCard.textContent = '当前无符合条件的下影线股票';
+    container.appendChild(emptyCard);
+  }
+
+  // 说明
+  const warnCard = document.createElement('div');
+  warnCard.className = 'card';
+  warnCard.style.cssText = 'background:rgba(38,166,154,0.08);border:1px solid rgba(38,166,154,0.2)';
+  const warnTitle = document.createElement('b');
+  warnTitle.style.color = '#26a69a';
+  warnTitle.textContent = '下影线策略说明';
+  warnCard.appendChild(warnTitle);
+  const warnList = document.createElement('div');
+  warnList.style.cssText = 'font-size:12px;color:var(--text2);line-height:1.6;margin-top:4px';
+  ['1. 盘后运行：收盘后筛选当天出现长下影线的股票',
+   '2. 条件：下影线>上影线且>=实体2倍 + 重心下移（高低均低于昨日）',
+   '3. 非当天买入，次日择机低吸',
+   '4. 影/体比越大，下方支撑越强',
+   '5. 点击卡片可跳转个股详细分析',
+   '6. 以上仅为技术分析，不构成投资建议！',
   ].forEach(text => {
     const p = document.createElement('div');
     p.textContent = text;

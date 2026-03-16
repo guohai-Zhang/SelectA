@@ -1440,7 +1440,8 @@ def api_shadow():
             upper_exists = df["上影线"] > 0.001
             cond_with_upper = upper_exists & (df["下影线"] > df["上影线"])
             cond_no_upper = (~upper_exists) & (df["下影线"] > df["实体"])
-            shadow_df = df[has_shadow & (cond_with_upper | cond_no_upper)].copy()
+            cond_ratio = df["下影线"] >= df["实体"] * 2
+            shadow_df = df[has_shadow & (cond_with_upper | cond_no_upper) & cond_ratio].copy()
 
             yield sse({"type": "progress", "msg": f"验证 {len(shadow_df)} 只候选...", "pct": 20})
 
@@ -1476,14 +1477,18 @@ def api_shadow():
                                    "pct": min(pct, 80)})
 
             passed_codes = {r["code"] for r in results}
-            final_df = shadow_df[shadow_df["代码"].isin(passed_codes)].copy()
-            final_df = final_df.sort_values("下影线", ascending=False)
-
             kdata_map = {r["code"]: r for r in results}
+            final_df = shadow_df[shadow_df["代码"].isin(passed_codes)].copy()
+            final_df["影体比"] = final_df.apply(
+                lambda r: r["下影线"] / r["实体"] if r["实体"] > 0.001 else 99, axis=1)
+            final_df = final_df.sort_values("影体比", ascending=False)
+
             output = []
             for _, row in final_df.iterrows():
                 code = str(row["代码"])
                 kd = kdata_map.get(code, {})
+                body = row["实体"]
+                ratio = row["影体比"]
                 output.append(jsonable({
                     "代码": code,
                     "名称": str(row.get("名称", "")),
@@ -1491,7 +1496,14 @@ def api_shadow():
                     "涨跌幅": round(row.get("涨跌幅", 0) or 0, 2),
                     "下影线": round(row["下影线"], 2),
                     "上影线": round(row["上影线"], 2),
-                    "实体": round(row["实体"], 2),
+                    "实体": round(body, 2),
+                    "影体比": round(ratio, 1),
+                    "换手率": round(row.get("换手率", 0) or 0, 1),
+                    "量比": round(row.get("量比", 0) or 0, 1),
+                    "振幅": round(row.get("振幅", 0) or 0, 1),
+                    "成交额": round(row.get("成交额", 0) or 0, 0),
+                    "市盈率": round(row.get("市盈率", 0) or 0, 1) if row.get("市盈率") else None,
+                    "流通市值": round(row.get("流通市值", 0) or 0, 0),
                     "昨日最高": kd.get("yest_high", 0),
                     "昨日最低": kd.get("yest_low", 0),
                 }))

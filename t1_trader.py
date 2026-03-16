@@ -6789,12 +6789,13 @@ def scan_shadow():
     df["下影线"] = df["实体下"] - df["最低"]
     df["实体"] = df["实体上"] - df["实体下"]
 
-    # 条件1：有下影线，且下影线 > 上影线；无上影线时下影线 > 实体
+    # 条件1：有下影线，且下影线 > 上影线（无上影线时下影线 > 实体）；下影线 >= 实体*2
     has_shadow = df["下影线"] > 0
     upper_exists = df["上影线"] > 0.001
     cond_with_upper = upper_exists & (df["下影线"] > df["上影线"])
     cond_no_upper = (~upper_exists) & (df["下影线"] > df["实体"])
-    cond1 = has_shadow & (cond_with_upper | cond_no_upper)
+    cond_ratio = df["下影线"] >= df["实体"] * 2
+    cond1 = has_shadow & (cond_with_upper | cond_no_upper) & cond_ratio
 
     shadow_df = df[cond1].copy()
     print(f"  下影线筛选通过: {len(shadow_df)} 只")
@@ -6848,13 +6849,16 @@ def scan_shadow():
     # ── 合并输出 ──
     print()
     print(f"[3/3] 最终结果: {len(results)} 只")
-    print("-" * 65)
-    print(f"{'代码':<8} {'名称':<8} {'最新价':>7} {'涨跌幅':>7} {'下影线':>7} {'上影线':>7} {'实体':>7}")
-    print("-" * 65)
+    print("-" * 80)
+    print(f"{'代码':<8} {'名称':<8} {'最新价':>7} {'涨跌幅':>7} {'下影线':>7} {'上影线':>7} {'实体':>7} {'影/体':>5} {'换手率':>6} {'量比':>5}")
+    print("-" * 80)
 
     passed_codes = {r["code"] for r in results}
+    kdata_map = {r["code"]: r for r in results}
     final_df = shadow_df[shadow_df["代码"].isin(passed_codes)].copy()
-    final_df = final_df.sort_values("下影线", ascending=False)
+    # 按下影线/实体比值降序
+    final_df["影体比"] = final_df.apply(lambda r: r["下影线"] / r["实体"] if r["实体"] > 0.001 else 99, axis=1)
+    final_df = final_df.sort_values("影体比", ascending=False)
 
     output = []
     for _, row in final_df.iterrows():
@@ -6865,9 +6869,15 @@ def scan_shadow():
         lower = row["下影线"]
         upper = row["上影线"]
         body = row["实体"]
-        # 找到对应的昨日数据
-        kdata = next((r for r in results if r["code"] == code), {})
-        print(f"{code:<8} {name:<8} {price:>7.2f} {chg:>+6.1f}% {lower:>7.2f} {upper:>7.2f} {body:>7.2f}")
+        ratio = row["影体比"]
+        turnover = row.get("换手率", 0) or 0
+        vol_ratio = row.get("量比", 0) or 0
+        amplitude = row.get("振幅", 0) or 0
+        volume = row.get("成交额", 0) or 0
+        pe = row.get("市盈率", 0) or 0
+        mkt_cap = row.get("流通市值", 0) or 0
+        kdata = kdata_map.get(code, {})
+        print(f"{code:<8} {name:<8} {price:>7.2f} {chg:>+6.1f}% {lower:>7.2f} {upper:>7.2f} {body:>7.2f} {ratio:>5.1f} {turnover:>5.1f}% {vol_ratio:>5.1f}")
         output.append({
             "代码": code,
             "名称": name,
@@ -6876,17 +6886,27 @@ def scan_shadow():
             "下影线": round(lower, 2),
             "上影线": round(upper, 2),
             "实体": round(body, 2),
+            "影体比": round(ratio, 1),
+            "换手率": round(turnover, 1),
+            "量比": round(vol_ratio, 1),
+            "振幅": round(amplitude, 1),
+            "成交额": round(volume, 0),
+            "市盈率": round(pe, 1) if pe else None,
+            "流通市值": round(mkt_cap, 0),
             "昨日最高": kdata.get("yest_high", 0),
             "昨日最低": kdata.get("yest_low", 0),
+            "今日最高": kdata.get("today_high", 0),
+            "今日最低": kdata.get("today_low", 0),
         })
 
-    print("-" * 65)
+    print("-" * 80)
     print(f"  共 {len(output)} 只符合条件")
     print()
     print("  筛选条件:")
-    print("  1. 有下影线，下影线 > 上影线（无上影线时下影线 > 实体）")
+    print("  1. 有下影线，下影线 > 上影线（无上影线时下影线 > 实体），下影线 >= 实体×2")
     print("  2. 今日最高 < 昨日最高 且 今日最低 < 昨日最低（重心下移）")
     print("  3. 非ST")
+    print("  策略：盘后选股，次日择机买入")
 
     return output
 

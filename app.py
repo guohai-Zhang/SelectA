@@ -19,7 +19,7 @@ import t1_trader as t1
 # ── 低资源模式（0.1 CPU / 512MB）──
 # 线程数和候选上限适配低配机器
 WORKERS = 8          # 线程池大小（与CLI一致）
-GO_OTHERS_CAP = 200  # go决策中无信号股票上限（与CLI一致）
+GO_OTHERS_CAP = 500  # go决策中无信号股票上限（与CLI一致）
 SCAN_OTHERS_CAP = 100  # scan中非优先股上限
 
 # ── 简单缓存 ──
@@ -494,6 +494,23 @@ def api_go():
             total = len(analyze_list)
 
             def analyze_for_go(code):
+                # ★ 市值分层换手率过滤
+                row0 = code_to_row.get(code, {})
+                turnover0 = row0.get("换手率", 0) or 0
+                mktcap0 = row0.get("总市值", 0)
+                if isinstance(mktcap0, (int, float)) and mktcap0 > 0:
+                    mktcap0 = mktcap0 / 1e8
+                else:
+                    mktcap0 = 0
+                if mktcap0 >= 500:
+                    min_turnover = 0.3
+                elif mktcap0 >= 100:
+                    min_turnover = 1.0
+                else:
+                    min_turnover = 2.0
+                if turnover0 < min_turnover and code not in capital_codes and code not in bb_codes:
+                    return None
+
                 kl = t1.fetch_kline(code, days=120)
                 if kl.empty or len(kl) < 30:
                     return None
@@ -556,17 +573,22 @@ def api_go():
                 else:
                     mktcap_yi = fi.get("总市值", 0) or 0
                 lc_bonus, lc_adj = t1.apply_largecap_adjustments(mktcap_yi)
-                go_th = (cal_threshold if cal_weights else 100) + lc_bonus
+                go_th = (cal_threshold if cal_weights else 60) + lc_bonus
                 sig_q = d.get("信号质量", "C级")
                 has_combo = d.get("黄金组合匹配", False)
-                # 推荐等级（与CLI go_decision一致）
-                if total_score >= go_th and has_combo:
+                ht_wr = d.get("高胜率组合胜率", 0)
+                # 推荐等级（与CLI一致：高胜率组合为最高优先级）
+                if ht_wr >= 80:
                     rec_level = "强推荐"
-                elif total_score >= go_th and "C级" not in sig_q:
+                elif ht_wr >= 70:
                     rec_level = "推荐"
-                elif total_score >= go_th:
-                    rec_level = "弱推荐"
-                elif total_score >= go_th * 0.8 and "C级" not in sig_q:
+                elif total_score >= go_th and "A级" in sig_q and has_combo:
+                    rec_level = "推荐"
+                elif "C级" in sig_q:
+                    rec_level = "仅参考"
+                elif total_score >= go_th and "A级" in sig_q:
+                    rec_level = "观望"
+                elif total_score >= go_th * 0.8:
                     rec_level = "观望"
                 else:
                     rec_level = "仅参考"
@@ -575,14 +597,17 @@ def api_go():
                 risk = t1.calc_position_and_risk(
                     total_score, sentiment_score, nb_total, limit_up, limit_down, price, kl,
                     largecap_adj=lc_adj)
+                wr_est = t1.estimate_winrate(total_score, ht_wr)
                 return {
                     "代码": code, "名称": name,
                     "最新价": price,
                     "涨跌幅": row.get("涨跌幅", latest.get("涨跌幅", 0)),
                     "换手率": row.get("换手率", 0),
                     "评分": round(total_score, 1),
+                    "预估胜率": wr_est,
                     "信号质量": sig_q,
                     "推荐等级": rec_level,
+                    "高胜率组合": d.get("高胜率组合", ""),
                     "技术分": round(s - fs - es, 1),
                     "基本面分": fs,
                     "聪明钱分": es,
@@ -623,18 +648,19 @@ def api_go():
 
             selected = [results[0]]
             used_ind = {results[0].get("行业", "")}
+            candidates = []
             for r in results[1:]:
-                if len(selected) >= 3:
-                    break
                 r_ind = r.get("行业", "")
-                if r_ind and r_ind not in used_ind:
-                    selected.append(r)
-                    used_ind.add(r_ind)
-            for r in results[1:]:
+                eff_score = r["评分"] * (0.9 if r_ind and r_ind in used_ind else 1.0)
+                candidates.append((eff_score, r))
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for eff_score, r in candidates:
                 if len(selected) >= 3:
                     break
-                if r not in selected:
-                    selected.append(r)
+                selected.append(r)
+                r_ind = r.get("行业", "")
+                if r_ind:
+                    used_ind.add(r_ind)
 
             # 信心指数（与CLI go_decision一致）
             confidence = 50

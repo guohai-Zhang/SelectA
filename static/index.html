@@ -571,15 +571,21 @@ function renderGoResults(data) {
     const rl = s['推荐等级'] || '仅参考';
     const rlColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : rl === '观望' ? '#9370db' : 'var(--text3)';
     const borderColor = rl === '强推荐' ? 'var(--red)' : rl === '推荐' ? 'var(--gold)' : rl === '弱推荐' ? 'var(--blue)' : rl === '观望' ? '#9370db' : 'var(--border)';
-    const rlNote = rl === '强推荐' ? '(回测胜率64%+)' : rl === '推荐' ? '(回测胜率57%+)' : rl === '弱推荐' ? '(回测胜率55%+)' : rl === '观望' ? '(接近门槛,观望为主)' : '(回测胜率<55%,慎入)';
+    const wrEst = s['预估胜率'] || 50;
+    const wrColor = wrEst >= 75 ? 'var(--red)' : wrEst >= 60 ? 'var(--gold)' : wrEst >= 55 ? 'var(--blue)' : 'var(--text3)';
+    const htCombo = s['高胜率组合'] || '';
     html += `<div class="go-stock" style="border-color:${borderColor}">
       <div class="go-stock-header">
         <div>
           <div class="go-stock-name">第${i+1}只: ${s['名称']}(${s['代码']})</div>
-          <div style="font-size:12px"><span style="color:${rlColor};font-weight:600">${rl}</span> <span style="font-size:10px;color:var(--text3)">${rlNote}</span> <span style="color:var(--text2)">${s['行业'] || ''}</span></div>
+          <div style="font-size:12px"><span style="color:${rlColor};font-weight:600">${rl}</span> <span style="color:var(--text2)">${s['行业'] || ''}</span></div>
         </div>
-        <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/300</span></div>
+        <div style="text-align:right">
+          <div class="go-stock-score">${s['评分']}<span style="font-size:12px;color:var(--text2)">/300</span></div>
+          <div style="font-size:13px;font-weight:600;color:${wrColor}">胜率 ${wrEst}%</div>
+        </div>
       </div>
+      ${htCombo ? `<div style="font-size:12px;color:var(--gold);margin:2px 0">匹配: ${htCombo}</div>` : ''}
       <div style="font-size:13px" class="${c}">现价 ${(s['最新价']||0).toFixed(2)} (${chgStr(s['涨跌幅']||0)})</div>
       <div style="font-size:12px;color:var(--text2);margin-top:4px">
         技术${s['技术分']||0} | 基本面${s['基本面分']||0}/50 | 聪明钱${s['聪明钱分']||0}/80
